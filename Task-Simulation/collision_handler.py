@@ -221,11 +221,69 @@ def hull_box_overlap(V_world, N_world, box, clearance=0.0):
 
 
 def _link_hull_hits_box(robot, poses, k, box):
-    """Second-stage check of link k against a box, using its convex hull."""
-    V, N, pad = robot.collision_link_hulls[k]
+    """Second-stage check of link k against a box, using its convex hull(s)
+    (the last link can have a second hull for a mounted gripper)."""
     T = poses[k]
     R, t = T[:3, :3], T[:3, 3]
-    return hull_box_overlap(V @ R.T + t, N @ R.T, box, HULL_CLEARANCE + pad)
+    for V, N, pad in robot.collision_link_hulls[k]:
+        if hull_box_overlap(V @ R.T + t, N @ R.T, box, HULL_CLEARANCE + pad):
+            return True
+    return False
+
+
+def convex_shapes_overlap(A, B, clearance=0.0):
+    """Separating-axis test between two convex shapes given as (points, face normals).
+
+    Uses both shapes' face normals (edge-edge axes skipped: may report an extra
+    overlap, never misses one). A shape with no normals (a line segment) only
+    contributes its points. `clearance` is the total gap required between them.
+    """
+    VA, NA = A
+    VB, NB = B
+    axes = [n for n in (NA, NB) if n is not None and len(n)]
+    if not axes:
+        return True
+    axes = np.vstack(axes)
+    pa, pb = VA @ axes.T, VB @ axes.T
+    separated = (pa.min(0) > pb.max(0) + clearance) | (pb.min(0) > pa.max(0) + clearance)
+    return not np.any(separated)
+
+
+def _world_shapes(robot, poses, label, capsule):
+    """Precise convex shapes for one capsule's part: the link's hull(s) if it has
+    them, otherwise the capsule's own segment. Returns [(points, normals, pad)]."""
+    hulls = getattr(robot, 'collision_link_hulls', None)
+    if isinstance(label, (int, np.integer)) and hulls and label < len(hulls) and poses is not None:
+        T = poses[label]
+        R, t = T[:3, :3], T[:3, 3]
+        return [(V @ R.T + t, N @ R.T, pad) for V, N, pad in hulls[label]]
+    _, p0, p1, r = capsule
+    return [(np.vstack([p0, p1]), None, r)]       # segment, padded by its radius
+
+
+def _parts_touch(shapes_a, shapes_b):
+    for VA, NA, pa in shapes_a:
+        for VB, NB, pb in shapes_b:
+            if NA is None and NB is None:
+                return True                        # two plain capsules: trust the capsule test
+            if convex_shapes_overlap((VA, NA), (VB, NB), HULL_CLEARANCE + pa + pb):
+                return True
+    return False
+
+
+_pose_cache = {}
+
+
+def _other_robot_poses(other):
+    """Link poses of a (non-moving) robot, cached until it moves."""
+    key = (id(other), np.asarray(other.q, float).tobytes(), np.asarray(other.base).tobytes())
+    poses = _pose_cache.get(key)
+    if poses is None:
+        poses = get_link_poses(other, other.q)
+        if len(_pose_cache) > 32:
+            _pose_cache.clear()
+        _pose_cache[key] = poses
+    return poses
 
 
 def _capsule_aabbs(capsules):
@@ -280,12 +338,16 @@ def _collision_pairs(robot, q, vertices, other_robots, margin, ignore_links,
     #    Base columns are included here: another arm can hit them.
     others = [o for o in (other_robots or []) if o is not robot]
     if others and all_capsules:
+        if poses is None:
+            poses = get_link_poses(robot, q)
         a_lo, a_hi = _capsule_aabbs(all_capsules)
         for other in others:
             theirs = _other_robot_capsules(other, margin)
             if not theirs:
                 continue
             b_lo, b_hi = _capsule_aabbs(theirs)
+            other_poses = _other_robot_poses(other)
+            pair_verdict = {}
             # Broad phase: only pairs whose bounding boxes overlap can touch
             overlap = np.all((a_lo[:, None, :] <= b_hi[None, :, :]) &
                              (b_lo[None, :, :] <= a_hi[:, None, :]), axis=2)
@@ -293,10 +355,19 @@ def _collision_pairs(robot, q, vertices, other_robots, margin, ignore_links,
                 label, a0, a1, ra = all_capsules[i]
                 olabel, b0, b1, rb = theirs[j]
                 dist, c1, c2 = segment_segment_distance(a0, a1, b0, b1)
-                if dist < ra + rb:
-                    hits.append((label, f"{other.name}:{olabel}", (c1 + c2) / 2))
-                    if stop_at_first:
-                        return hits
+                if dist >= ra + rb:
+                    continue
+                # Capsules touch: let the precise shapes (hulls) decide
+                key = (label, olabel) if (label != 'tool' and olabel != 'tool') else (label, olabel, i, j)
+                if key not in pair_verdict:
+                    pair_verdict[key] = _parts_touch(
+                        _world_shapes(robot, poses, label, all_capsules[i]),
+                        _world_shapes(other, other_poses, olabel, theirs[j]))
+                if not pair_verdict[key]:
+                    continue
+                hits.append((label, f"{other.name}:{olabel}", (c1 + c2) / 2))
+                if stop_at_first:
+                    return hits
     return hits
 
 

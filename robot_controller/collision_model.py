@@ -27,8 +27,9 @@ def load_collision_capsules(robot, mesh_dir, mesh_names):
         [(np.array(a, float), np.array(b, float), float(r)) for a, b, r in link]
         for link in data['links']
     ]
-    # Convex hull per link: (vertices (n,3), face normals (m,3), pad metres) in DH frame k
+    # Convex hulls per link: a LIST of (vertices (n,3), face normals (m,3), pad metres)
+    # in DH frame k (a list, so a mounted gripper can add its own hull to the last link)
     robot.collision_link_hulls = [
-        (np.array(h['vertices'], float), np.array(h['normals'], float), float(h.get('pad', 0.0)))
+        [(np.array(h['vertices'], float), np.array(h['normals'], float), float(h.get('pad', 0.0)))]
         for h in data.get('hulls', [])
     ] or None

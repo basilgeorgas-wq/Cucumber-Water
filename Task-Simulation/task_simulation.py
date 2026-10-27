@@ -23,6 +23,7 @@ from DOBOT_CR5 import DOBOT_CR5
 from MOTOMAN_GP4 import MOTOMAN_GP4
 
 from environment_controller import Environment_Manager
+from gripper import Gripper
 from movement_handler import (ikine_move, rmrc_move, linear_move, start_joystick_control,
                               create_linear_path, find_approach_configuration,
                               generate_ik_initial_guesses, solve_ik_with_strategies,
@@ -194,6 +195,8 @@ class TaskSimulation():
         # Every robot is checked against the others (each move skips itself)
         robots = [self.Motoman, self.OMRON, self.DOBOT]
 
+        self._mount_grippers()
+
         # The Dobot holds the (empty) glass upright from the very start
         self._setup_dobot_with_glass(faces, vertices, face_normals, robots)
 
@@ -224,22 +227,29 @@ class TaskSimulation():
     # ======================================================================
     # Task settings (metres / radians). Change these when real grippers are added.
     # ======================================================================
-    GRIPPER_LENGTH_OMRON = 0.0     # flange -> fingertip of the Omron gripper
-    GRIPPER_LENGTH_DOBOT = 0.0     # flange -> fingertip of the Dobot gripper
-    FLANGE_TO_GLASS = 0.05         # flange -> glass centre when the Dobot holds it (+ gripper)
+    # Grippers: distances along the tool axis from the robot's last DH frame
+    OMRON_FLANGE_FACE = 0.006      # DH frame -> Omron flange face (gripper mounts here)
+    DOBOT_FLANGE_FACE = 0.015      # DH frame -> Dobot flange face
+    GRIPPER_LENGTH_OMRON = OMRON_FLANGE_FACE + 0.150   # -> Robotiq 2F-85 grip point
+                                                       #    (finger pads, 1.3 cm above the tips)
+    GRIPPER_LENGTH_DOBOT = DOBOT_FLANGE_FACE + 0.189   # -> AG-95 grip point (finger pad centre)
+    FLANGE_TO_GLASS = 0.0          # extra offset from the grip point to the glass centre
 
     SLICE_POSITION = (-0.8, 0.05, 0.94)   # where the cut slice is placed after slicing
     SINK_GLASS_POSITION = (-0.685, -1.345, 1.04)  # glass centre under the tap spout
     SINK_SLIDE = 0.12              # the glass slides in/out horizontally this far under the spout
-    HANDOVER_GLASS_POSITION = (0.0, -0.6, 1.1) # glass centre when held out for the Omron
+    HANDOVER_GLASS_POSITION = (0.0, -0.5, 1.05) # glass centre when held out for the Omron
+                                                # (middle of the region both arms + grippers can use)
     APPROACH_HEIGHT = 0.10         # Omron goes this far above a pick/drop point first
-    PICK_GAP = 0.015               # fingertip height above the slice when picking (bare flange
-                                   # can't go lower without touching the bench; set ~0 with a gripper)
-    DROP_CLEARANCE = 0.13          # Omron fingertip height above the glass rim when dropping
-                                   # (12-14 cm works without a gripper: the bare flange needs room
-                                   #  above the glass; retune once a gripper is fitted)
+    PICK_GAP = 0.0                 # grip point height above the slice centre when picking
+    DROP_CLEARANCE = 0.06          # Omron grip point height above the glass rim when dropping
+    DROP_APPROACH_HEIGHT = 0.08    # Omron comes down onto the drop point from this far above
+                                   # (the slice hangs 1.9 cm below it, fingertips 1.3 cm below)
 
-    TOOL_DOWN = SE3.Rx(pi)         # tool z-axis pointing straight down
+    # Omron tool pointing straight down, wrist turned 90 deg so the Robotiq's
+    # fingers close along world y (across the slice's flat faces) and stay
+    # clear of the Omron's wrist camera
+    TOOL_DOWN = SE3.Rz(pi / 2) * SE3.Rx(pi)
 
     CUT_PITCH = np.deg2rad(105)    # knife angle while slicing (90 = level, 105 = 15 deg nose-down)
     CUT_FLANGE_X = -0.91           # Motoman hand position while slicing (blade reaches x = -0.8)
@@ -328,6 +338,13 @@ class TaskSimulation():
             return None
         return q_new
 
+    def _mount_grippers(self):
+        """Robotiq 2F-85 on the Omron, DH Robotics AG-95 on the Dobot."""
+        self.omron_gripper = Gripper(self.OMRON, "robotiq_2f85", self.env,
+                                     mount_offset=self.OMRON_FLANGE_FACE)
+        self.dobot_gripper = Gripper(self.DOBOT, "dh_ag95", self.env,
+                                     mount_offset=self.DOBOT_FLANGE_FACE)
+
     def _setup_dobot_with_glass(self, faces, vertices, face_normals, robots):
         """Put the glass in the Dobot's hand (upright) and choose its start pose.
 
@@ -342,6 +359,8 @@ class TaskSimulation():
         self.T_flange_glass = (SE3(0, 0, reach) * SE3.Rx(pi / 2) * SE3(0, 0, -H / 2)).A
         glass_axis = [(self.T_flange_glass @ np.array([0, 0, z, 1.0]))[:3] for z in (0.0, H)]
         self.glass = env_mgr.add_glass()
+        if getattr(self, 'dobot_gripper', None) is not None:
+            self.dobot_gripper.grip()          # fingers closed around the glass
 
         # Start pose first (glass not attached yet, so attach() keeps the right offset)
         T_sink = self._dobot_flange_for_glass(self.SINK_GLASS_POSITION, pi / 2)
@@ -484,7 +503,7 @@ class TaskSimulation():
         # ---- 4. Omron picks up the slice ----------------------------------
         print("Omron picking up the slice")
         sx, sy, sz = self.SLICE_POSITION
-        pick_z = sz + env_mgr.SLICE_RADIUS + self.PICK_GAP + self.GRIPPER_LENGTH_OMRON
+        pick_z = sz + self.PICK_GAP + self.GRIPPER_LENGTH_OMRON   # flange height: grip at slice centre
         above_ok = self._move_above("Omron above slice", self.OMRON,
                                     SE3(sx, sy, pick_z + self.APPROACH_HEIGHT) * self.TOOL_DOWN,
                                     SE3(sx, sy, pick_z) * self.TOOL_DOWN)
@@ -492,6 +511,8 @@ class TaskSimulation():
                                          SE3(sx, sy, pick_z) * self.TOOL_DOWN, linear=True,
                                          steps=10, position_tolerance=0.005)
         if picked:
+            self.omron_gripper.grip()
+            self.env.step(0.3)
             self.OMRON.attach(cuc_slice)          # slice now moves with the Omron
             self._move("Omron lift slice", self.OMRON,
                        SE3(sx, sy, pick_z + self.APPROACH_HEIGHT) * self.TOOL_DOWN, linear=True,
@@ -503,19 +524,20 @@ class TaskSimulation():
             gx, gy, gz = self.HANDOVER_GLASS_POSITION
             drop_z = gz + H / 2 + self.DROP_CLEARANCE + self.GRIPPER_LENGTH_OMRON
             over = self._move_above("Omron above glass", self.OMRON,
-                                    SE3(gx, gy, drop_z + self.APPROACH_HEIGHT) * self.TOOL_DOWN,
+                                    SE3(gx, gy, drop_z + self.DROP_APPROACH_HEIGHT) * self.TOOL_DOWN,
                                     SE3(gx, gy, drop_z) * self.TOOL_DOWN)
             dropped = over and self._move("Omron lower to glass", self.OMRON,
                                           SE3(gx, gy, drop_z) * self.TOOL_DOWN, linear=True,
                                           steps=10, position_tolerance=0.005)
             if dropped:
                 # Release: slice drops to the bottom of the glass and moves with it
+                self.omron_gripper.open()
                 self.OMRON.detach(cuc_slice)
                 cuc_slice.T = (SE3(gx, gy, gz - H / 2 + env_mgr.SLICE_RADIUS + 0.005)).A
                 self.DOBOT.attach(cuc_slice)
                 self.env.step(0.05)
                 self._move("Omron move away", self.OMRON,
-                           SE3(gx, gy, drop_z + self.APPROACH_HEIGHT) * self.TOOL_DOWN, linear=True,
+                           SE3(gx, gy, drop_z + self.DROP_APPROACH_HEIGHT) * self.TOOL_DOWN, linear=True,
                            steps=10, position_tolerance=0.005)
         else:
             print("Skipping the drop: " +

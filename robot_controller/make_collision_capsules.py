@@ -148,7 +148,29 @@ def build(robot, mesh_dir, mesh_names):
     print(f"  saved {out}")
 
 
+def build_gripper(gripper_dir, name):
+    """Collision shapes for a gripper, in the gripper's own frame (mount face at
+    z = 0, fingers along +z). Covers both the open and the gripping finger
+    positions, so it stays valid whichever state the gripper is in."""
+    P = np.vstack([trimesh.load(os.path.join(gripper_dir, f"{name}_{state}.stl")).vertices
+                   for state in ("open", "grip")])
+    caps = fit_capsules(P)
+    hull = simplified_hull(P)
+    out = os.path.join(gripper_dir, f"{name}_collision.json")
+    with open(out, 'w') as f:
+        json.dump({'frame': 'gripper frame: mount face z=0, fingers along +z',
+                   'capsules': [[a.tolist(), b.tolist(), float(r)] for a, b, r in caps],
+                   'hull': hull}, f)
+    print(f"  {name}: {len(caps)} capsule(s), radii "
+          + ", ".join(f"{r*100:.1f}cm" for _, _, r in caps)
+          + f"; hull pad {hull['pad']*1000:.1f}mm -> {out}")
+
+
 if __name__ == "__main__":
+    print("Grippers")
+    for g in ("robotiq_2f85", "dh_ag95"):
+        build_gripper(os.path.join(HERE, "Gripper_stl"), g)
+
     from DOBOT_CR5 import DOBOT_CR5
     from OMRON_TM5 import OMRON_TM5_700
     from MOTOMAN_GP4 import MOTOMAN_GP4
