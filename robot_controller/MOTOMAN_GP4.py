@@ -47,10 +47,26 @@ class MOTOMAN_GP4(DHRobot3D):
         super().__init__(links, link3D_names, name = 'Motoman_GP4', link3d_dir = current_path, qtest = qtest, qtest_transforms = qtest_transforms)
         self.q = qtest
         
-        knife_file = os.path.join(current_path, 'knife.dae')
+        # File is 'Knife.dae' (capital K) - case matters on Linux/macOS
+        knife_file = os.path.join(current_path, 'Knife.dae')
         if os.path.exists(knife_file):
             self.knife_mesh = geometry.Mesh(knife_file, color=(0.7, 0.7, 0.7))
             self.has_knife = True
+
+            # Knife collision model, in the flange frame (last DH frame).
+            # The blade is flat (~2.4 mm thick) and lies in the flange x-z plane.
+            # Outline = convex hull of Knife.dae as drawn, simplified to 10 points
+            # (x, z) in metres. Heel near the flange, tip at z ~ 0.25 m.
+            outline_xz = [(-0.0097, -0.0356), (0.0305, -0.0314), (0.0278, 0.0454),
+                          (0.0213, 0.1119), (0.0129, 0.1649), (-0.0048, 0.2241),
+                          (-0.0148, 0.2416), (-0.0230, 0.2493), (-0.0335, 0.1585),
+                          (-0.0289, -0.0211)]
+            pts = [[x, 0.0, z] for x, z in outline_xz]
+            # Capsules round the outline, plus one down the middle of the blade
+            segments = [(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
+            segments.append(([0.0004, 0.0, -0.033], [-0.0230, 0.0, 0.2493]))
+            self.collision_tool_segments = segments
+            self.collision_tool_radius = 0.002   # half blade thickness + a little slack
             print(f"Knife loaded from: {knife_file}")
             # Set initial knife position
             T_ee = self.fkine(self.q)
