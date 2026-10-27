@@ -30,10 +30,10 @@ class Environment_Manager():
             'face_normals': bench_normals
         })
 
-        # Cupboard
+        # Cupboard - sized to the kitchen model (x -0.93..-0.49 incl. handles, y -2.09..-0.55)
         cupboard, cupboard_vertices, cupboard_faces, cupboard_normals = self.create_obstacle(
-            x=-0.74, y=-1.3, z=1.88,
-            x_length=0.4, y_length=1.5, z_length=0.77,
+            x=-0.71, y=-1.32, z=1.88,
+            x_length=0.44, y_length=1.54, z_length=0.77,
             env=self.env,
             name="cupboard"
         )
@@ -43,6 +43,15 @@ class Environment_Manager():
             'faces': cupboard_faces,
             'face_normals': cupboard_normals
         })
+
+        # Sink tap (in the kitchen model, previously had no hitbox): upright neck + spout
+        for name, (cx, cy, cz), (lx, ly, lz) in [
+            ("tap_neck",  (-0.83, -1.41, 1.09), (0.09, 0.11, 0.36)),   # x -0.875..-0.785, z 0.91..1.27
+            ("tap_spout", (-0.755, -1.385, 1.2075), (0.22, 0.14, 0.135)), # out to x -0.645, z 1.14..1.275
+        ]:
+            _, v, f, n = self.create_obstacle(x=cx, y=cy, z=cz, x_length=lx, y_length=ly,
+                                              z_length=lz, env=self.env, name=name)
+            self.obstacles.append({'name': name, 'vertices': v, 'faces': f, 'face_normals': n})
 
         # Fridge body hitbox
         fridge, fridge_vertices, fridge_faces, fridge_normals = self.create_obstacle(
