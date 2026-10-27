@@ -1,0 +1,170 @@
+import swift
+import spatialgeometry as geometry
+import os
+from spatialmath import SE3
+from math import pi
+from ir_support import RectangularPrism
+from spatialgeometry import Cuboid
+import numpy as np
+
+class Environment_Manager():
+    def __init__(self, env):
+        print("Initializing Environment Manager")
+        self.env = env
+        self.obstacles = []  # Store obstacle data
+        
+        self.add_cucumber(-0.8, -0.2, 0.94)
+        self.add_enclosure(0, 0, 0)
+
+        # Bench hitbox
+        bench, bench_vertices, bench_faces, bench_normals = self.create_obstacle(
+            x=-0.6, y=-1.235, z=0.46,
+            x_length=0.6, y_length=3.2, z_length=0.9,
+            env=self.env,
+            name="bench"
+        )
+        self.obstacles.append({
+            'name': 'bench',
+            'vertices': bench_vertices,
+            'faces': bench_faces,
+            'face_normals': bench_normals
+        })
+
+        # Cupboard
+        cupboard, cupboard_vertices, cupboard_faces, cupboard_normals = self.create_obstacle(
+            x=-0.74, y=-1.3, z=1.88,
+            x_length=0.4, y_length=1.5, z_length=0.77,
+            env=self.env,
+            name="cupboard"
+        )
+        self.obstacles.append({
+            'name': 'cupboard',
+            'vertices': cupboard_vertices,
+            'faces': cupboard_faces,
+            'face_normals': cupboard_normals
+        })
+
+        # Fridge body hitbox
+        fridge, fridge_vertices, fridge_faces, fridge_normals = self.create_obstacle(
+            x=-0.6, y=0.75, z=0.8,
+            x_length=0.7, y_length=0.7, z_length=1.7,
+            env=self.env,
+            name="fridge"
+        )
+        self.obstacles.append({
+            'name': 'fridge',
+            'vertices': fridge_vertices,
+            'faces': fridge_faces,
+            'face_normals': fridge_normals
+        })
+
+        # Fridge door hitbox
+        door, door_vertices, door_faces, door_normals = self.create_obstacle(
+            x=0.1, y=0.9, z=0.62,
+            rotx=0, roty=0, rotz=-28*pi/180,
+            x_length=0.7, y_length=0.1, z_length=1.1,
+            env=self.env,
+            name="fridge_door"
+        )
+        self.obstacles.append({
+            'name': 'fridge_door',
+            'vertices': door_vertices,
+            'faces': door_faces,
+            'face_normals': door_normals
+        })
+
+    def add_cucumber(self, x, y, z, rotx=0.0, roty=0.0, rotz=0.0):
+        current_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visual_files")
+        stl_path = os.path.join(current_dir, "cucumber_base.stl")
+        cucumber = geometry.Mesh(stl_path, pose=SE3(float(x), float(y), float(z))*SE3.Rx(rotx)*SE3.Ry(roty)*SE3.Rz(rotz), 
+        scale=[1.0, 1.0, 1.0], color=(0.0, 1.0, 0.0, 1.0))
+        self.env.add(cucumber)
+        print("Cucumber Added")
+
+    def add_enclosure(self, x=0.0, y=0.0, z=0.0, rotx=0.0, roty=0.0, rotz=0.0):
+        current_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visual_files")
+        stl_path = os.path.join(current_dir, "Ethan_Kitchen.stl")
+        enclosure = geometry.Mesh(
+            stl_path,
+            pose=SE3(float(x), float(y), float(z)) * SE3.Rx(rotx) * SE3.Ry(roty) * SE3.Rz(rotz),
+            scale=[1, 1, 1],       
+        )
+        enclosure.collide = False        
+        self.env.add(enclosure)
+        print("Environment Added")
+
+    def create_obstacle(self, x, y, z, rotx=0, roty=0, rotz=0, x_length=0, y_length=0, z_length=0, env=None, name="obstacle"):
+        """
+        Create a cuboid obstacle in the Swift environment, prepared for collision checking.
+        """
+        lwh = [x_length, y_length, z_length]
+        centre = [x, y, z]
+        pose = SE3(float(x), float(y), float(z)) * SE3.Rx(rotx) * SE3.Ry(roty) * SE3.Rz(rotz)
+        
+        obstacle = Cuboid(scale=lwh, color=[1.0, 0.0, 0.0, 0.2])
+        obstacle.T = pose
+        obstacle.name = name
+        env.add(obstacle)
+        
+        # Get base geometry centered at origin
+        vertices, faces, face_normals = RectangularPrism(lwh[0], lwh[1], lwh[2], center=[0, 0, 0]).get_data()
+        
+        # Transform vertices by the pose
+        vertices = np.array(vertices)
+        vertices_homogeneous = np.hstack([vertices, np.ones((len(vertices), 1))])
+        vertices_transformed = (pose.A @ vertices_homogeneous.T).T[:, :3]
+        
+        return obstacle, vertices_transformed, faces, np.array(face_normals)
+    
+    def get_collision_data(self):
+        """
+        Returns aggregated collision data for all obstacles.
+        Handles variable-length faces (quads, triangles, etc).
+        
+        Returns:
+        --------
+        faces : list of lists
+            Combined face indices from all obstacles (each face is a list of vertex indices)
+        vertices : np.ndarray
+            Combined vertices from all obstacles (N x 3)
+        face_normals : np.ndarray
+            Combined face normals from all obstacles (M x 3)
+        """
+        all_faces = []
+        all_vertices = []
+        all_face_normals = []
+        vertex_offset = 0
+        
+        for obstacle_data in self.obstacles:
+            vertices = np.array(obstacle_data['vertices'])
+            faces = obstacle_data['faces']  # Keep as list of lists
+            face_normals = np.array(obstacle_data['face_normals'])
+            
+            # Offset face indices to account for accumulated vertices
+            faces_offset = []
+            for face in faces:
+                # Convert to list if numpy array, then offset each index
+                face_list = [int(idx) + vertex_offset for idx in face]
+                faces_offset.append(face_list)
+            
+            all_vertices.append(vertices)
+            all_faces.extend(faces_offset)  # Extend, not append, to flatten the list
+            all_face_normals.append(face_normals)
+            
+            # Update offset for next obstacle
+            vertex_offset += len(vertices)
+        
+        # Combine into single arrays
+        vertices_combined = np.vstack(all_vertices) if all_vertices else np.array([])
+        face_normals_combined = np.vstack(all_face_normals) if all_face_normals else np.array([])
+        
+        return all_faces, vertices_combined, face_normals_combined
+
+if __name__ == "__main__":
+    env = swift.Swift()
+    env.launch(realtime=True)
+    manager = Environment_Manager(env)
+    
+    faces, vertices, face_normals = manager.get_collision_data()
+    
+    env.hold()
