@@ -13,6 +13,10 @@ from collision_handler import (
     find_collision_free_path_rrt
 )
 
+# A move only counts as successful if the tool ends within this angle of the
+# requested orientation (unless the move is called with position_only=True)
+DEFAULT_ORIENTATION_TOLERANCE = np.deg2rad(1.0)   # radians
+
 def ikine_move(robot, target_pose, env=None, q0=None, 
                steps=50, interpolation=2, point_freq=1, 
                visualize=True, show_path_dots=True,
@@ -21,7 +25,16 @@ def ikine_move(robot, target_pose, env=None, q0=None,
                check_collision=True, faces=None, vertices=None, 
                face_normals=None, collisions_list=None,
                collision_free_search=True, stop_on_collision=True,
-               other_robots=None):
+               other_robots=None,
+               # Orientation parameters
+               orientation_tolerance=DEFAULT_ORIENTATION_TOLERANCE,
+               position_only=False):
+    """Joint-space move to target_pose.
+
+    orientation_tolerance : max orientation error in radians (default 1 deg)
+    position_only         : True to ignore orientation entirely (only if the
+                            tool direction really doesn't matter for this move)
+    """
    
     # Validate collision parameters
     check_collision = validate_collision_params(
@@ -49,27 +62,34 @@ def ikine_move(robot, target_pose, env=None, q0=None,
     #Create varied initial guesses - current, zero, random
     initial_guesses = generate_ik_initial_guesses(robot, q_start, max_attempts)
     
-    #solve IK with different masks - position only, position bias, position+orientation
+    # Solve IK: full pose (unless position_only), within joint limits,
+    # collision-free, and closest to the current joints
     ik_result = solve_ik_with_strategies(
         robot, T_target, initial_guesses,
         tolerance=tolerance,
-        check_collision_fn=collision_check_fn
+        check_collision_fn=collision_check_fn if stop_on_collision else None,
+        orientation_tolerance=orientation_tolerance,
+        position_only=position_only,
+        q_reference=q_start
     )
     
     #Logging
     if not ik_result['success']:
-        print(f"IK failed after {ik_result['attempts']} attempts (error: {ik_result['error']*1000:.2f}mm)")
-        print_section_footer()
-        return None, None, False
-    
-    if not ik_result['collision_free'] and stop_on_collision:
-        print(f"IK solution in collision (error: {ik_result['error']*1000:.2f}mm) - ABORTED")
+        if ik_result['reason'] == 'collision':
+            print(f"IK solution in collision (error: {ik_result['error']*1000:.2f}mm) - ABORTED")
+        else:
+            print(f"IK failed after {ik_result['attempts']} attempts: "
+                  f"{describe_ik_failure(ik_result, tolerance, orientation_tolerance)}")
         print_section_footer()
         return None, None, False
     
     q_target = ik_result['q']
+    if not stop_on_collision and collision_check_fn is not None and collision_check_fn(q_target):
+        ik_result['collision_free'] = False
     status = "collision-free" if ik_result['collision_free'] else "IN COLLISION"
-    print(f"IK solved (attempts: {ik_result['attempts']}, error: {ik_result['error']*1000:.2f}mm, {status})")
+    ori_txt = "ignored" if position_only else f"{np.degrees(ik_result['ori_error']):.2f}deg"
+    print(f"IK solved (attempts: {ik_result['attempts']}, error: {ik_result['error']*1000:.2f}mm, "
+          f"orientation: {ori_txt}, {status})")
     
     # ========== PHASE 2: Generate trajectory ==========
     #Set interpolation - quintic or trapezoidal
@@ -158,8 +178,18 @@ def linear_move(robot, target_pose, env=None, q0=None, steps=50,
                 # Collision parameters
                 check_collision=True, faces=None, vertices=None, 
                 face_normals=None, stop_on_collision=True,
-                other_robots=None):
-    #Increase waypoints to create smoother path
+                other_robots=None,
+                # Orientation / smoothness parameters
+                orientation_tolerance=DEFAULT_ORIENTATION_TOLERANCE,
+                position_only=False,
+                max_joint_step=np.deg2rad(20)):
+    """Straight-line Cartesian move, solved as IK at each waypoint.
+
+    orientation_tolerance : max orientation error per waypoint, radians
+    position_only         : True to ignore orientation entirely
+    max_joint_step        : largest allowed joint change between waypoints;
+                            bigger means the arm flipped configuration
+    """
 
     # Validate collision parameters
     check_collision = validate_collision_params(
@@ -190,17 +220,20 @@ def linear_move(robot, target_pose, env=None, q0=None, steps=50,
     # ========== PHASE 1: Check target reachability ==========
     if check_reachability:
         print(f"\nChecking target reachability (tolerance: {position_tolerance*1000:.1f}mm)...")
-        target_reachable = check_target_reachable(
+        reach = check_target_reachable(
             robot, T_target, q_start, 
             tolerance=position_tolerance,
             max_attempts=max_ik_attempts,
-            check_collision_fn=collision_check_fn
+            check_collision_fn=collision_check_fn,
+            orientation_tolerance=orientation_tolerance,
+            position_only=position_only
         )
         
-        if not target_reachable:
-            print("Target not reachable")
+        if not reach['success']:
+            print("Target not reachable: " +
+                  describe_ik_failure(reach, position_tolerance, orientation_tolerance))
             print_section_footer()
-            return None, False, {'error': 'target_unreachable'}
+            return None, False, {'error': 'target_unreachable', 'reason': reach['reason']}
         else:
             print("Target is reachable")
     
@@ -215,7 +248,8 @@ def linear_move(robot, target_pose, env=None, q0=None, steps=50,
         'position_errors': np.zeros(steps),
         'max_joint_velocities': np.zeros(steps),
         'failed_waypoints': [],
-        'collision_waypoints': []
+        'collision_waypoints': [],
+        'jump_waypoints': []
     }
     
     q_prev = q_start.copy()
@@ -224,7 +258,8 @@ def linear_move(robot, target_pose, env=None, q0=None, steps=50,
     print(f"\nSolving IK for {steps} waypoints...")
     
     # ========== PHASE 2: Solve IK for all waypoints ==========
-    for i in range(steps):
+    # Waypoint 0 is the robot's current joints (no IK, so no jump at the start)
+    for i in range(1, steps):
         if i % max(1, steps // 20) == 0:
             print(f"{int(100*i/steps)}% ", end='', flush=True)
         
@@ -232,42 +267,53 @@ def linear_move(robot, target_pose, env=None, q0=None, steps=50,
         alpha = i / (steps - 1) if steps > 1 else 1.0
         T_interp = T_start.interp(T_target, alpha)
         
-        # Generate initial guesses for this waypoint
+        # Previous waypoint first, so IK stays on the same arm configuration
         initial_guesses = [q_prev, q_start, np.zeros(robot.n)]
         
-        # Solve IK
         ik_result = solve_ik_with_strategies(
             robot, T_interp, initial_guesses,
             tolerance=position_tolerance,
-            check_collision_fn=None 
-            
+            check_collision_fn=None,           # collisions checked below, per waypoint
+            orientation_tolerance=orientation_tolerance,
+            position_only=position_only,
+            q_reference=q_prev,
+            max_solutions=len(initial_guesses)
         )
         
         if ik_result['success']:
-            q_matrix[i, :] = ik_result['q']
+            q_i = ik_result['q']
+            dq = q_i - q_prev
+            diagnostics['max_joint_velocities'][i] = np.max(np.abs(dq))
+            
+            # A big joint change between neighbouring waypoints = configuration flip
+            if np.max(np.abs(dq)) > max_joint_step:
+                print(f"\n Waypoint {i}: joint jump of {np.degrees(np.max(np.abs(dq))):.1f}deg "
+                      f"(limit {np.degrees(max_joint_step):.0f}deg)")
+                diagnostics['jump_waypoints'].append(i)
+                q_matrix[i, :] = q_prev         # placeholder, never zeros
+                success_flags[i] = False
+                all_success = False
+                continue
+            
+            q_matrix[i, :] = q_i
             success_flags[i] = True
             diagnostics['ik_attempts'][i] = ik_result['attempts']
             diagnostics['position_errors'][i] = ik_result['error']
             
             # Check collision
             if check_collision and collision_check_fn is not None:
-                collision = collision_check_fn(q_matrix[i, :])
-                
-                if collision:
+                if collision_check_fn(q_i):
                     diagnostics['collision_waypoints'].append(i)
                     print(f"\n Waypoint {i} in collision!")
                     success_flags[i] = False
                     all_success = False
             
-            # Track joint velocities
-            if i > 0:
-                dq = q_matrix[i, :] - q_matrix[i-1, :]
-                diagnostics['max_joint_velocities'][i] = np.max(np.abs(dq))
-            
-            q_prev = q_matrix[i, :].copy()
+            q_prev = q_i.copy()
             
         else:
-            print(f"\n Waypoint {i} IK failed (error: {ik_result['error']*1000:.1f}mm)")
+            print(f"\n Waypoint {i} IK failed: "
+                  f"{describe_ik_failure(ik_result, position_tolerance, orientation_tolerance)}")
+            q_matrix[i, :] = q_prev             # placeholder, never zeros
             success_flags[i] = False
             diagnostics['failed_waypoints'].append(i)
             all_success = False
@@ -275,7 +321,8 @@ def linear_move(robot, target_pose, env=None, q0=None, steps=50,
     print("100% ✓")
     
     # ========== PHASE 3: Handle failures ==========
-    has_failures = len(diagnostics['failed_waypoints']) > 0 or len(diagnostics['collision_waypoints']) > 0
+    has_failures = (len(diagnostics['failed_waypoints']) > 0 or len(diagnostics['collision_waypoints']) > 0
+                    or len(diagnostics['jump_waypoints']) > 0)
     
     if has_failures:
         if stop_on_collision and len(diagnostics['collision_waypoints']) > 0:
@@ -284,7 +331,8 @@ def linear_move(robot, target_pose, env=None, q0=None, steps=50,
             return None, False, diagnostics
         
         if smooth_failures:
-            failed_set = set(diagnostics['failed_waypoints'] + diagnostics['collision_waypoints'])
+            failed_set = set(diagnostics['failed_waypoints'] + diagnostics['collision_waypoints']
+                             + diagnostics['jump_waypoints'])
             print(f"\n Smoothing {len(failed_set)} problematic waypoints...")
             print(" WARNING: Smoothing may not guarantee collision-free path!")
             
@@ -313,6 +361,13 @@ def linear_move(robot, target_pose, env=None, q0=None, steps=50,
                         print(f"   Interpolated waypoints {start_fail} to {end_fail}")
                 else:
                     i += 1
+    
+    # Anything still unresolved (e.g. the final waypoint failed) -> don't move
+    if not np.all(success_flags):
+        bad = np.where(~success_flags)[0].tolist()
+        print(f"\n✗ Motion ABORTED: waypoints {bad} could not be solved or smoothed")
+        print_section_footer()
+        return None, False, diagnostics
     
     # ========== PHASE 4: Summary ==========
     print(f"\n{'='*70}")
@@ -579,116 +634,177 @@ def print_section_footer():
     print("="*70 + "\n")
 
 def generate_ik_initial_guesses(robot, q_start, max_attempts=10):
-    """Generate varied initial guesses."""
-
+    """Initial guesses for IK: current joints first, then defaults, then random."""
     guesses = [
-        q_start,                           # Current position
+        np.array(q_start, dtype=float),    # Current position (gives the nearest solution)
         np.zeros(robot.n),                 # Zero configuration
-        robot.qz if hasattr(robot, 'qz') else np.zeros(robot.n)  # Default pose
+        np.array(robot.qz) if hasattr(robot, 'qz') else np.zeros(robot.n)  # Default pose
     ]
-    
-    # Add random configurations
-    for _ in range(max_attempts - len(guesses)):
-        q_rand = np.zeros(robot.n)
-        for j in range(robot.n):
-            if hasattr(robot.links[j], 'qlim') and robot.links[j].qlim is not None:
-                q_min, q_max = robot.links[j].qlim
-                q_rand[j] = np.random.uniform(q_min, q_max)
-            else:
-                q_rand[j] = np.random.uniform(-np.pi, np.pi)
-        guesses.append(q_rand)
-    
+    qlim = get_joint_limits(robot)
+    for _ in range(max(0, max_attempts - len(guesses))):
+        guesses.append(np.random.uniform(qlim[0], qlim[1]))
     return guesses
 
-def solve_ik_with_strategies(robot, T_target, initial_guesses, 
-                            tolerance=0.01, check_collision_fn=None):
 
-    best_solution = None
-    best_error = float('inf')
-    
-    # Define IK masks to attempt with
-    strategies = [
-        {'mask': [1,1,1,1,1,1], 'name': 'full'},
-        {'mask': [1,1,1,0,0,0], 'name': 'position_only'},
-        {'mask': [1,1,1,0.1,0.1,0.1], 'name': 'position_weighted'},
-    ]
-    
-    attempt_count = 0
-    
+def get_joint_limits(robot):
+    """2 x n array of joint limits (falls back to +/-pi where none is set)."""
+    qlim = np.zeros((2, robot.n))
+    for j in range(robot.n):
+        lim = getattr(robot.links[j], 'qlim', None)
+        if lim is None or np.any(np.isnan(lim)):
+            qlim[:, j] = [-np.pi, np.pi]
+        else:
+            qlim[:, j] = lim
+    return qlim
+
+
+def pose_errors(robot, q, T_target):
+    """(position error in metres, orientation error in radians) of q against T_target."""
+    T = robot.fkine(q)
+    pos_err = np.linalg.norm(T.t - T_target.t)
+    R_err = T.R.T @ T_target.R
+    ori_err = np.arccos(np.clip((np.trace(R_err) - 1) / 2, -1.0, 1.0))
+    return pos_err, ori_err
+
+
+def wrap_to_reference(q, q_ref, qlim):
+    """For each joint pick q + 2*pi*k (still inside its limits) closest to q_ref.
+
+    Joints with more than 360 deg of travel (e.g. Omron/Dobot/Motoman wrists)
+    have several equivalent angles; this stops the robot spinning a full turn
+    when a nearby equivalent exists.
+    """
+    q = np.array(q, dtype=float)
+    for j in range(len(q)):
+        best = q[j]
+        for k in range(-3, 4):
+            cand = q[j] + 2 * np.pi * k
+            if qlim[0, j] - 1e-9 <= cand <= qlim[1, j] + 1e-9:
+                if not (qlim[0, j] - 1e-9 <= best <= qlim[1, j] + 1e-9) or \
+                        abs(cand - q_ref[j]) < abs(best - q_ref[j]):
+                    best = cand
+        q[j] = best
+    return q
+
+
+def solve_ik_with_strategies(robot, T_target, initial_guesses,
+                             tolerance=0.01, check_collision_fn=None,
+                             orientation_tolerance=DEFAULT_ORIENTATION_TOLERANCE,
+                             position_only=False, q_reference=None,
+                             max_solutions=5):
+    """Solve IK and return the valid solution closest to q_reference.
+
+    A solution is valid only if ALL of these hold:
+      - position error  < tolerance (m)
+      - orientation error < orientation_tolerance (rad), unless position_only=True
+      - every joint inside its limits
+      - collision-free (if check_collision_fn is given)
+
+    Returns a dict: success, q, error, ori_error, attempts, collision_free, reason.
+    On failure q is None and `reason` says what blocked it.
+    """
+    qlim = get_joint_limits(robot)
+    q_ref = np.array(initial_guesses[0] if q_reference is None else q_reference, dtype=float)
+    mask = [1, 1, 1, 0, 0, 0] if position_only else None
+
+    valid = []
+    rejected = {'not_converged': 0, 'orientation': 0, 'limits': 0, 'collision': 0}
+    best_pos, best_ori = float('inf'), float('inf')
+    attempts = 0
+
     for q_init in initial_guesses:
-        #run through masks
-        for strategy in strategies:
-            attempt_count += 1
-            
-            try:
-                ik_solution = robot.ikine_LM(T_target, q0=q_init, mask=strategy['mask'])
-                
-                if ik_solution is not None and hasattr(ik_solution, 'q'):
-                    T_achieved = robot.fkine(ik_solution.q)
-                    pos_error = np.linalg.norm(T_target.t - T_achieved.t)
-                    
-                    # Check if this solution is better
-                    if pos_error < best_error:
-                        best_error = pos_error
-                        best_solution = ik_solution.q
-                    
-                    # Check if solution meets tolerance
-                    if ik_solution.success and pos_error < tolerance:
-                        # Check collision
-                        is_collision_free = True
-                        if check_collision_fn is not None:
-                            is_collision_free = not check_collision_fn(ik_solution.q)
-                            
-                            if not is_collision_free:
-                                continue  # Try next strategy
-                        
-                        # Found valid solution
-                        return {
-                            'success': True,
-                            'q': ik_solution.q,
-                            'error': pos_error,
-                            'attempts': attempt_count,
-                            'collision_free': is_collision_free
-                        }
-            
-            except Exception as e:
-                continue
-    
-    # No perfect solution found, return best effort
-    if best_solution is not None:
-        is_collision_free = True
-        if check_collision_fn is not None:
-            is_collision_free = not check_collision_fn(best_solution)
-        
-        return {
-            'success': best_error < tolerance,  
-            'q': best_solution,
-            'error': best_error,
-            'attempts': attempt_count,
-            'collision_free': is_collision_free
-        }
-    
-    # Complete failure
-    return {
-        'success': False,
-        'q': None,
-        'error': best_error,
-        'attempts': attempt_count,
-        'collision_free': False
-    }
+        attempts += 1
+        try:
+            sol = robot.ikine_LM(T_target, q0=q_init, joint_limits=True, slimit=1, mask=mask)
+        except Exception:
+            rejected['not_converged'] += 1
+            continue
 
-def check_target_reachable(robot, T_target, q_start, tolerance=0.01, 
-                          max_attempts=10, check_collision_fn=None):
-    """Check if target pose is reachable using IK."""
+        q = wrap_to_reference(sol.q, q_ref, qlim)
+        pos_err, ori_err = pose_errors(robot, q, T_target)
+        best_pos = min(best_pos, pos_err)
+        if pos_err < tolerance:
+            best_ori = min(best_ori, ori_err)
+
+        if pos_err >= tolerance:
+            rejected['not_converged'] += 1
+            continue
+        if not position_only and ori_err >= orientation_tolerance:
+            rejected['orientation'] += 1
+            continue
+        if np.any(q < qlim[0] - 1e-9) or np.any(q > qlim[1] + 1e-9):
+            rejected['limits'] += 1
+            continue
+        if check_collision_fn is not None and check_collision_fn(q):
+            rejected['collision'] += 1
+            continue
+
+        valid.append((np.linalg.norm(q - q_ref), q, pos_err, ori_err))
+        if len(valid) >= max_solutions:
+            break
+
+    if valid:
+        _, q, pos_err, ori_err = min(valid, key=lambda v: v[0])
+        return {'success': True, 'q': q, 'error': pos_err, 'ori_error': ori_err,
+                'attempts': attempts, 'collision_free': True, 'reason': None}
+
+    # Nothing valid: report the most useful reason
+    if rejected['collision'] > 0:
+        reason = 'collision'
+    elif rejected['limits'] > 0:
+        reason = 'joint_limits'
+    elif rejected['orientation'] > 0:
+        reason = 'orientation'
+    else:
+        reason = 'unreachable'
+
+    # If the full pose failed, check whether the POSITION alone is reachable.
+    # If it is, the real problem is the requested tool orientation.
+    if not position_only and reason in ('unreachable', 'joint_limits'):
+        for q_init in initial_guesses[:10]:
+            try:
+                sol = robot.ikine_LM(T_target, q0=q_init, joint_limits=True, slimit=1,
+                                     mask=[1, 1, 1, 0, 0, 0])
+            except Exception:
+                continue
+            q = sol.q
+            if (pose_errors(robot, q, T_target)[0] < tolerance
+                    and np.all(q >= qlim[0] - 1e-9) and np.all(q <= qlim[1] + 1e-9)):
+                reason = 'orientation'
+                break
+    return {'success': False, 'q': None, 'error': best_pos, 'ori_error': best_ori,
+            'attempts': attempts, 'collision_free': reason != 'collision', 'reason': reason}
+
+
+def describe_ik_failure(result, tolerance, orientation_tolerance):
+    """Plain-language explanation of why IK failed."""
+    reason = result['reason']
+    if reason == 'collision':
+        return "every solution found is in collision"
+    if reason == 'joint_limits':
+        return "solutions found are outside the joint limits"
+    if reason == 'orientation':
+        return ("the position is reachable, but not with this tool orientation - "
+                "change the target orientation, or pass position_only=True "
+                "if the tool direction doesn't matter for this move")
+    return (f"target out of reach (closest {result['error']*1000:.1f} mm, "
+            f"limit {tolerance*1000:.1f} mm)")
+
+
+def check_target_reachable(robot, T_target, q_start, tolerance=0.01,
+                           max_attempts=10, check_collision_fn=None,
+                           orientation_tolerance=DEFAULT_ORIENTATION_TOLERANCE,
+                           position_only=False):
+    """Check if target pose is reachable using IK. Returns the solve result dict."""
     initial_guesses = generate_ik_initial_guesses(robot, q_start, max_attempts)
-    
-    result = solve_ik_with_strategies(
-        robot, T_target, initial_guesses, 
+    return solve_ik_with_strategies(
+        robot, T_target, initial_guesses,
         tolerance=tolerance,
-        check_collision_fn=check_collision_fn
+        check_collision_fn=check_collision_fn,
+        orientation_tolerance=orientation_tolerance,
+        position_only=position_only,
+        q_reference=q_start
     )
-    
-    return result['success'] and result['error'] < tolerance
 
 def animate_trajectory_unified(robot, q_matrix, T_target, env, 
                                point_freq=1, collision_free=True, 
