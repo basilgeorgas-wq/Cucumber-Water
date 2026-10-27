@@ -400,62 +400,133 @@ def linear_move(robot, target_pose, env=None, q0=None, steps=50,
     
     return q_matrix, all_success, diagnostics
 
-#Position only currently
-def rmrc_move(robot, q0, cartesian_path, env, delta_t=0.05, 
-              min_manip=0.01, damping_factor=0.01
-              ):
-    
-    # Get dimensions of path
-    dimension = cartesian_path.shape[0]
-    steps = cartesian_path.shape[1]
-    
-    # Initialize storage
-    q_trajectory = []
-    manipulability = np.zeros(steps)
-    velocity_error = np.zeros((dimension, steps))
-    
-    q_trajectory.append(q0)
-    robot.q = q0
-    
-    # RMRC loop
-    for i in range(steps - 1):
-        # Calculate desired Cartesian velocity
-        x_dot = (cartesian_path[:, i+1] - cartesian_path[:, i]) / delta_t
-        
-        # Get Jacobian at CURRENT configuration in trajectory
-        # (This is the key - we use q_trajectory[i], which may differ from robot.q)
-        q_current = q_trajectory[i]
-        J = robot.jacob0(q_current)
-        J = J[:dimension, :]  # Take only position rows
-        
-        # Calculate manipulability
-        manipulability[i] = np.sqrt(max(0, linalg.det(J @ J.T)))
-        
-        # Solve for joint velocities
-        if manipulability[i] < min_manip:
-            # Use Damped Least Squares for low manipulability
-            q_dot = linalg.inv(J.T @ J + damping_factor * np.eye(robot.n)) @ J.T @ x_dot
-            if i % 10 == 0:
-                print(f"  Step {i}: Low manip ({manipulability[i]:.3f}), using DLS")
-        else:
-            # Use pseudoinverse for good manipulability
-            q_dot = linalg.pinv(J) @ x_dot
-        
-        # Calculate velocity error
-        velocity_error[:, i] = x_dot - J @ q_dot
-        
-        # Update joint configuration
-        q_next = q_current + delta_t * q_dot
-        q_trajectory.append(q_next)
-        
-        robot.q = q_next
-        env.step(delta_t)
+def rmrc_move(robot, q0, cartesian_path, env, delta_t=0.05,
+              min_manip=0.01, damping_factor=0.01,
+              # Orientation
+              target_orientation=None, position_only=False,
+              # Safety
+              max_joint_vel=1.5,
+              check_collision=True, faces=None, vertices=None, face_normals=None,
+              other_robots=None, stop_on_collision=True):
+    """Resolved-rate motion control along a straight Cartesian path.
 
-    final_pos = robot.fkine(robot.q).t
-    target_pos = cartesian_path[:, -1]
-    error_mm = np.linalg.norm(final_pos - target_pos) * 1000
-    print(f"RMRC: Complete. Final error: {error_mm:.2f}mm")
-    
+    cartesian_path     : 3 x N array of positions (e.g. from create_linear_path)
+    target_orientation : None  -> hold the starting tool orientation the whole way
+                         SE3 / SO3 / 3x3 -> blend smoothly from start to this orientation
+    position_only      : True = old behaviour (orientation free to drift)
+    max_joint_vel      : rad/s; if exceeded the whole step is slowed, not distorted
+    Collision checking works like ikine_move (pass faces/vertices/face_normals,
+    and other_robots). The move stops before entering a collision or a joint limit.
+
+    Returns (q_trajectory, manipulability, velocity_error) as before.
+    velocity_error is 6 x N (3 x N if position_only).
+    """
+    from spatialmath import UnitQuaternion
+    from spatialmath.base import trlog, vex
+
+    check_collision = validate_collision_params(check_collision, faces, vertices, face_normals)
+    print_section_header("RMRC MOVE", check_collision)
+
+    steps = cartesian_path.shape[1]
+    dim = 3 if position_only else 6
+    q_trajectory = [np.array(q0, dtype=float)]
+    manipulability = np.zeros(steps)
+    velocity_error = np.zeros((dim, steps))
+    qlim = get_joint_limits(robot)
+
+    # Orientation schedule: hold, or slerp from start to target
+    R_start = robot.fkine(q0).R
+    if target_orientation is None:
+        R_end = R_start
+    else:
+        R_end = target_orientation.R if hasattr(target_orientation, 'R') else np.asarray(target_orientation)
+    quat_start, quat_end = UnitQuaternion(R_start), UnitQuaternion(R_end)
+    same_orientation = np.allclose(R_start, R_end, atol=1e-9)
+    def R_desired(i):
+        # (spatialmath's interp divides by zero when start == end, so skip it then)
+        if same_orientation or steps <= 1:
+            return R_end
+        return quat_start.interp(quat_end, i / (steps - 1)).R
+
+    robot.q = q_trajectory[0]
+    stopped = None
+    slowed_steps = 0
+    max_pos_dev, max_ori_dev = 0.0, 0.0
+
+    for i in range(steps - 1):
+        q = q_trajectory[i]
+        T = robot.fkine(q)
+
+        # Closed loop: aim for the NEXT path point from where the tool ACTUALLY is,
+        # so any drift is corrected on the following step
+        v = (cartesian_path[:, i + 1] - T.t) / delta_t
+        if position_only:
+            x_dot = v
+        else:
+            R_err = R_desired(i + 1) @ T.R.T              # rotation still needed
+            omega = vex(trlog(R_err, check=False)) / delta_t if not np.allclose(R_err, np.eye(3)) \
+                else np.zeros(3)
+            x_dot = np.r_[v, omega]
+
+        J = robot.jacob0(q)[:dim, :]
+        manipulability[i] = np.sqrt(max(0.0, np.linalg.det(J @ J.T)))
+
+        if manipulability[i] < min_manip:
+            # Damped least squares near singularities
+            q_dot = J.T @ np.linalg.solve(J @ J.T + damping_factor * np.eye(dim), x_dot)
+        else:
+            q_dot = np.linalg.pinv(J) @ x_dot
+
+        # Joint speed limit: slow the whole step down (keeps the direction = stays on the line)
+        peak = np.max(np.abs(q_dot))
+        if peak > max_joint_vel:
+            q_dot *= max_joint_vel / peak
+            slowed_steps += 1
+
+        velocity_error[:, i] = x_dot - J @ q_dot
+        q_next = q + delta_t * q_dot
+
+        # Stop BEFORE leaving the joint limits
+        if np.any(q_next < qlim[0]) or np.any(q_next > qlim[1]):
+            j = int(np.argmax((q_next < qlim[0]) | (q_next > qlim[1])))
+            stopped = f"joint {j+1} would pass its limit at step {i+1}/{steps}"
+            break
+
+        # Stop BEFORE entering a collision
+        if check_collision and stop_on_collision:
+            hit, _ = check_single_config_collision(robot, q_next, faces, vertices, face_normals,
+                                                   return_once_found=True, other_robots=other_robots)
+            if hit:
+                stopped = f"collision ahead at step {i+1}/{steps}"
+                break
+
+        q_trajectory.append(q_next)
+        robot.q = q_next
+        if env is not None:
+            env.step(delta_t)
+
+        # Track how far the tool strays from the path
+        T_now = robot.fkine(q_next)
+        max_pos_dev = max(max_pos_dev, np.linalg.norm(T_now.t - cartesian_path[:, i + 1]))
+        if not position_only:
+            R_d = R_desired(i + 1)
+            max_ori_dev = max(max_ori_dev, np.arccos(np.clip((np.trace(R_d.T @ T_now.R) - 1) / 2, -1, 1)))
+
+    # Summary
+    T_final = robot.fkine(robot.q)
+    pos_err = np.linalg.norm(T_final.t - cartesian_path[:, len(q_trajectory) - 1]) * 1000
+    if stopped:
+        print(f"RMRC STOPPED: {stopped}")
+    print(f"RMRC: {len(q_trajectory)}/{steps} steps. Final error: {pos_err:.2f}mm. "
+          f"Max deviation from line: {max_pos_dev*1000:.2f}mm"
+          + ("" if position_only else f", from orientation: {np.degrees(max_ori_dev):.2f}deg"))
+    if slowed_steps:
+        print(f"  {slowed_steps} steps slowed to respect max_joint_vel")
+    if np.any(manipulability[:len(q_trajectory) - 1] < min_manip):
+        print(f"  Passed near a singularity (min manipulability "
+              f"{manipulability[:len(q_trajectory) - 1].min():.4f}) - damped least squares used")
+    print_section_footer()
+
     return q_trajectory, manipulability, velocity_error
 
 def jog_velocity(robot, velocity_cmd, dt=0.1, lambda_dls=0.1, max_joint_vel=1.0, 
