@@ -81,6 +81,40 @@ class Environment_Manager():
         self.env.add(cucumber)
         print("Cucumber Added")
 
+    # ---- Props the robots carry -------------------------------------------
+    # glass-cup.stl is modelled 1.2 m wide x 1.5 m tall with its base at z=0,
+    # so it is scaled down to a real glass size.
+    GLASS_SCALE = 0.06                      # -> 7.2 cm wide, 9 cm tall
+    GLASS_RADIUS = 0.6 * GLASS_SCALE
+    GLASS_HEIGHT = 1.5 * GLASS_SCALE
+    SLICE_RADIUS = 0.019                    # cuc_slice.stl: 3.8 cm disc, 1.1 cm thick
+
+    def add_glass(self, pose=None):
+        """Glass (base at the mesh origin). Returns the Swift mesh."""
+        current_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visual_files")
+        s = self.GLASS_SCALE
+        glass = geometry.Mesh(os.path.join(current_dir, "glass-cup.stl"),
+                              pose=pose if pose is not None else SE3(),
+                              scale=[s, s, s], color=(0.8, 0.9, 1.0, 0.35))
+        self.env.add(glass)
+        return glass
+
+    def add_water(self, pose=None):
+        """Water inside the glass: translucent blue cylinder centred on its own origin."""
+        water = geometry.Cylinder(radius=self.GLASS_RADIUS * 0.85, length=self.GLASS_HEIGHT * 0.6,
+                                  pose=pose if pose is not None else SE3(),
+                                  color=(0.2, 0.5, 1.0, 0.5))
+        self.env.add(water)
+        return water
+
+    def add_slice(self, pose):
+        """One cucumber slice (disc standing on edge, centred on its own origin)."""
+        current_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visual_files")
+        cuc_slice = geometry.Mesh(os.path.join(current_dir, "cuc_slice.stl"),
+                                  pose=pose, color=(0.3, 0.8, 0.3, 1.0))
+        self.env.add(cuc_slice)
+        return cuc_slice
+
     def add_enclosure(self, x=0.0, y=0.0, z=0.0, rotx=0.0, roty=0.0, rotz=0.0):
         current_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visual_files")
         stl_path = os.path.join(current_dir, "Ethan_Kitchen.stl")
