@@ -6,98 +6,149 @@ from itertools import combinations
 from ir_support import line_plane_intersection
 from roboticstoolbox import jtraj
 
-#Checks single
-def check_single_config_collision(robot, q, faces, vertices, face_normals, 
-                                  env=None, collisions_list=None, 
-                                  return_once_found=True):
-    collision_detected = False
-    collision_points = []
-    
-    # Get the transform of every joint (start and end of every link)
-    tr = get_link_poses(robot, q)
-    
-    # Go through each link and also each triangle face
-    for i in range(np.size(tr, 2) - 1):
-        for j, face in enumerate(faces):
-            vert_on_plane = vertices[face][0]
-            intersect_p, check = line_plane_intersection(
-                face_normals[j], 
-                vert_on_plane, 
-                tr[i][:3, 3], 
-                tr[i+1][:3, 3]
-            )
-            
-            # List of all triangle combinations in a face
-            triangle_list = np.array(list(combinations(face, 3)), dtype=int)
-            
-            if check == 1:
-                # Additional check: ensure intersection is between the two link points
-                link_start = tr[i][:3, 3]
-                link_end = tr[i+1][:3, 3]
-                link_vector = link_end - link_start
-                link_length = np.linalg.norm(link_vector)
-                
-                # Check if intersection point is actually on the link segment
-                to_intersect = intersect_p - link_start
-                projection = np.dot(to_intersect, link_vector) / (link_length ** 2 + 1e-10)
-                
-                # Only check triangles if intersection is on the link (not extended line)
-                if 0 <= projection <= 1:
-                    for triangle in triangle_list:
-                        if is_intersection_point_inside_triangle(intersect_p, vertices[triangle]):
-                            collision_detected = True
-                            collision_points.append(intersect_p)
-                            
-                            # Create a red sphere in Swift at the intersection point
-                            if env is not None and collisions_list is not None:
-                                new_collision = Sphere(radius=0.05, color=[1.0, 0.0, 0.0, 1.0])
-                                new_collision.T = transl(intersect_p[0], intersect_p[1], intersect_p[2])
-                                env.add(new_collision)
-                                collisions_list.append(new_collision)
-                            
-                            if return_once_found:
-                                return collision_detected, collision_points
-                            break
-    
-    return collision_detected, collision_points
+# ---------------------------------------------------------------------------
+# Collision model
+#   - Each robot link = straight segment between consecutive joint frames
+#     (from fkine_all), inflated by `margin` metres to give the link thickness.
+#   - Each obstacle = oriented box, rebuilt from the 8 vertices that
+#     RectangularPrism produces for it (so the faces/vertices/normals interface
+#     used everywhere else stays the same).
+#   - Segment vs box is tested in the box's own frame with slab clipping, which
+#     catches a link crossing a face AND a link sitting completely inside a box.
+# ---------------------------------------------------------------------------
 
-#Checks list
+DEFAULT_LINK_MARGIN = 0.03   # metres of "padding" around each link centreline
+DEFAULT_IGNORE_LINKS = (0,)  # segment 0 = base column, bolted to the bench, never moves
+
+
+def boxes_from_vertices(vertices):
+    """Rebuild oriented boxes from RectangularPrism vertices (8 per box).
+
+    RectangularPrism vertex order: v0=(-,-,-), v1=(+,-,-), v3=(-,+,-), v4=(-,-,+).
+    Returns a list of dicts: centre (3,), R (3x3, columns = box axes), half (3,).
+    """
+    vertices = np.asarray(vertices, dtype=float)
+    if len(vertices) % 8 != 0:
+        raise ValueError("Collision vertices must come in groups of 8 (one RectangularPrism per obstacle)")
+
+    boxes = []
+    for k in range(0, len(vertices), 8):
+        v = vertices[k:k + 8]
+        ex, ey, ez = v[1] - v[0], v[3] - v[0], v[4] - v[0]
+        lengths = np.array([np.linalg.norm(ex), np.linalg.norm(ey), np.linalg.norm(ez)])
+        R = np.column_stack([ex / lengths[0], ey / lengths[1], ez / lengths[2]])
+        if not np.allclose(R.T @ R, np.eye(3), atol=1e-6):
+            raise ValueError(f"Obstacle {k // 8} vertices are not a rectangular box")
+        boxes.append({'centre': v.mean(axis=0), 'R': R, 'half': lengths / 2})
+    return boxes
+
+
+def segment_box_intersection(p0, p1, box, margin=0.0):
+    """Does segment p0->p1 touch the box (grown by `margin`)?
+
+    Returns (hit, point) where point is the first contact point in world frame.
+    """
+    R, c, h = box['R'], box['centre'], box['half'] + margin
+    a = R.T @ (np.asarray(p0, float) - c)   # segment start in box frame
+    d = R.T @ (np.asarray(p1, float) - c) - a
+    t_enter, t_exit = 0.0, 1.0
+
+    for k in range(3):
+        if abs(d[k]) < 1e-12:               # parallel to this slab
+            if abs(a[k]) > h[k]:
+                return False, None
+        else:
+            t1 = (-h[k] - a[k]) / d[k]
+            t2 = (h[k] - a[k]) / d[k]
+            if t1 > t2:
+                t1, t2 = t2, t1
+            t_enter = max(t_enter, t1)
+            t_exit = min(t_exit, t2)
+            if t_enter > t_exit:
+                return False, None
+
+    point = c + R @ (a + t_enter * d)
+    return True, point
+
+
+def get_link_segments(robot, q, ignore_links=DEFAULT_IGNORE_LINKS):
+    """List of (link_index, start_point, end_point) for every non-zero-length link."""
+    poses = get_link_poses(robot, q)          # list of n+1 4x4 arrays
+    segments = []
+    for i in range(len(poses) - 1):
+        if i in ignore_links:
+            continue
+        p0, p1 = poses[i][:3, 3], poses[i + 1][:3, 3]
+        if np.linalg.norm(p1 - p0) < 1e-6:    # e.g. coincident wrist frames
+            continue
+        segments.append((i, p0, p1))
+    return segments
+
+
+def _mark_collision(point, env, collisions_list):
+    """Drop a red sphere in Swift at a collision point."""
+    if env is not None and collisions_list is not None:
+        new_collision = Sphere(radius=0.05, color=[1.0, 0.0, 0.0, 1.0])
+        new_collision.T = transl(point[0], point[1], point[2])
+        env.add(new_collision)
+        collisions_list.append(new_collision)
+
+
+def check_single_config_collision(robot, q, faces, vertices, face_normals,
+                                  env=None, collisions_list=None,
+                                  return_once_found=True,
+                                  margin=DEFAULT_LINK_MARGIN,
+                                  ignore_links=DEFAULT_IGNORE_LINKS):
+    """Check one joint configuration. Returns (collision_detected, collision_points).
+
+    `faces` and `face_normals` are accepted for backwards compatibility; the
+    box test only needs the vertices.
+    """
+    boxes = boxes_from_vertices(vertices)
+    collision_points = []
+
+    for _, p0, p1 in get_link_segments(robot, q, ignore_links):
+        for box in boxes:
+            hit, point = segment_box_intersection(p0, p1, box, margin)
+            if hit:
+                collision_points.append(point)
+                _mark_collision(point, env, collisions_list)
+                if return_once_found:
+                    return True, collision_points
+
+    return len(collision_points) > 0, collision_points
+
+
 def is_collision(robot, q_list, faces, vertices, face_normals,
-                collisions_list=None, env=None, return_once_found=True):
-    
+                 collisions_list=None, env=None, return_once_found=True,
+                 margin=DEFAULT_LINK_MARGIN, ignore_links=DEFAULT_IGNORE_LINKS):
+    """Check a list of configurations (a trajectory). True if any collides."""
+    found = False
     for q in q_list:
-        # Get the transform of every joint (start and end of every link)
-        tr = get_link_poses(robot, q)
-        
-        # Go through each link and also each triangle face
-        for i in range(np.size(tr, 2) - 1):
-            for j, face in enumerate(faces):
-                vert_on_plane = vertices[face][0]
-                intersect_p, check = line_plane_intersection(
-                    face_normals[j], 
-                    vert_on_plane, 
-                    tr[i][:3, 3], 
-                    tr[i+1][:3, 3]
-                )
-                
-                # List of all triangle combinations in a face
-                triangle_list = np.array(list(combinations(face, 3)), dtype=int)
-                
-                if check == 1:
-                    for triangle in triangle_list:
-                        if is_intersection_point_inside_triangle(intersect_p, vertices[triangle]):
-                            # Create a red sphere in Swift at the intersection point
-                            if env is not None and collisions_list is not None:
-                                new_collision = Sphere(radius=0.05, color=[1.0, 0.0, 0.0, 1.0])
-                                new_collision.T = transl(intersect_p[0], intersect_p[1], intersect_p[2])
-                                env.add(new_collision)
-                                collisions_list.append(new_collision)
-                            
-                            if return_once_found:
-                                return True
-                            break
-    
-    return False
+        hit, _ = check_single_config_collision(
+            robot, q, faces, vertices, face_normals,
+            env=env, collisions_list=collisions_list,
+            return_once_found=return_once_found,
+            margin=margin, ignore_links=ignore_links
+        )
+        if hit:
+            found = True
+            if return_once_found:
+                return True
+    return found
+
+
+def collision_report(robot, q, vertices, obstacle_names=None,
+                     margin=DEFAULT_LINK_MARGIN, ignore_links=DEFAULT_IGNORE_LINKS):
+    """Debug helper: list of (link_index, obstacle_name) pairs that collide."""
+    boxes = boxes_from_vertices(vertices)
+    names = obstacle_names or [f"obstacle_{k}" for k in range(len(boxes))]
+    hits = []
+    for i, p0, p1 in get_link_segments(robot, q, ignore_links):
+        for name, box in zip(names, boxes):
+            if segment_box_intersection(p0, p1, box, margin)[0]:
+                hits.append((i, name))
+    return hits
 
 #Barycentric check intersections
 def is_intersection_point_inside_triangle(intersect_p, triangle_verts):
@@ -327,7 +378,7 @@ def visualize_collision_spheres(robot, q, env, radius=0.03, color=None):
     spheres = []
     
     tr = get_link_poses(robot, q)
-    for i in range(np.size(tr, 2)):
+    for i in range(len(tr)):
         sphere = Sphere(radius=radius, color=color)
         sphere.T = tr[i]
         env.add(sphere)
