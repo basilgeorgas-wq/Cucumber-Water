@@ -32,7 +32,7 @@ def ikine_move(robot, target_pose, env=None, q0=None,
                orientation_tolerance=DEFAULT_ORIENTATION_TOLERANCE,
                position_only=False, preferred_q=None,
                # Path planning (used when the straight path collides)
-               rrt_max_iterations=3000, rrt_max_time=60.0):
+               rrt_max_iterations=8000, rrt_max_time=60.0):
     """Joint-space move to target_pose.
 
     rrt_max_iterations / rrt_max_time : search budget for the RRT path planner
@@ -901,7 +901,8 @@ def find_approach_configuration(robot, T_approach, T_final, q_start,
                                 faces=None, vertices=None, face_normals=None,
                                 other_robots=None, steps=10, tolerance=0.005,
                                 orientation_tolerance=DEFAULT_ORIENTATION_TOLERANCE,
-                                max_joint_step=np.deg2rad(20), max_attempts=40):
+                                max_joint_step=np.deg2rad(20), max_attempts=40,
+                                q_final=None):
     """Joint configuration at T_approach from which a straight line to T_final works.
 
     Use before a pick/place: the arm configuration chosen at the approach point
@@ -909,6 +910,9 @@ def find_approach_configuration(robot, T_approach, T_final, q_start,
     can sweep the upper arm into the bench). This solves T_final first, then
     walks back up the line, so the returned configuration is guaranteed to have
     a reachable, collision-free, flip-free straight path down.
+
+    q_final : optional joints already chosen for T_final (e.g. from an earlier
+              backwards step); otherwise every valid IK solution is tried.
 
     Returns the joint vector at T_approach, or None if no such path exists.
     """
@@ -918,14 +922,15 @@ def find_approach_configuration(robot, T_approach, T_final, q_start,
             robot, q, faces, vertices, face_normals, return_once_found=True,
             other_robots=other_robots)[0]
 
-    final = solve_ik_with_strategies(
+    final = {'solutions': []} if q_final is not None else solve_ik_with_strategies(
         robot, T_final, generate_ik_initial_guesses(robot, q_start, max_attempts),
         tolerance=tolerance, check_collision_fn=collides,
         orientation_tolerance=orientation_tolerance, q_reference=q_start,
         max_solutions=max_attempts)
 
-    for q_final in final['solutions']:            # nearest-to-current first
-        q = q_final
+    candidates = [np.asarray(q_final, float)] if q_final is not None else final['solutions']
+    for q_end in candidates:                      # nearest-to-current first
+        q = q_end
         ok = True
         for k in range(1, steps):
             T = T_final.interp(T_approach, k / (steps - 1))

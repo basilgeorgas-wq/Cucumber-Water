@@ -6,8 +6,9 @@ from roboticstoolbox import jtraj
 
 # ---------------------------------------------------------------------------
 # Collision model
-#   - Each robot link = straight segment between consecutive joint frames
-#     (from fkine_all), inflated by `margin` metres to give the link thickness.
+#   - Each robot link = 1-4 capsules fitted around its 3D mesh (loaded from
+#     <robot mesh folder>/collision_capsules.json). Without that file, links fall
+#     back to straight lines between joint frames padded by `margin` metres.
 #   - Each obstacle = oriented box, rebuilt from the 8 vertices that
 #     RectangularPrism produces for it (so the faces/vertices/normals interface
 #     used everywhere else stays the same).
@@ -17,8 +18,10 @@ from roboticstoolbox import jtraj
 #     catches a link crossing a face AND a link sitting completely inside a box.
 # ---------------------------------------------------------------------------
 
-DEFAULT_LINK_MARGIN = 0.03   # metres of "padding" around each link centreline
-DEFAULT_IGNORE_LINKS = (0,)  # segment 0 = base column, bolted to the bench, never moves
+DEFAULT_LINK_MARGIN = 0.03   # metres of padding around each link centreline (fallback model only)
+FITTED_CLEARANCE = 0.01      # extra metres added to the mesh-fitted capsules
+HULL_CLEARANCE = 0.002       # extra metres kept between a link's convex hull and an obstacle
+DEFAULT_IGNORE_LINKS = (0,)  # link 0 = robot base, bolted down, never moves (skipped vs obstacles)
 
 
 def boxes_from_vertices(vertices):
@@ -96,7 +99,21 @@ def get_collision_capsules(robot, q, margin=DEFAULT_LINK_MARGIN,
         robot.collision_tool_radius   : radius in metres for those segments
     """
     poses = get_link_poses(robot, q)
-    capsules = [(i, p0, p1, margin) for i, p0, p1 in _segments_from_poses(poses, ignore_links)]
+    fitted = getattr(robot, 'collision_link_capsules', None)
+    if fitted:
+        # Capsules fitted to the 3D meshes (robot_controller/make_collision_capsules.py),
+        # stored in each link's DH frame. Label k = mesh link k (0 = base).
+        capsules = []
+        for k, link_caps in enumerate(fitted):
+            if k in ignore_links:
+                continue
+            T = poses[k]
+            R, t = T[:3, :3], T[:3, 3]
+            for a, b, r in link_caps:
+                capsules.append((k, R @ a + t, R @ b + t, r + FITTED_CLEARANCE))
+    else:
+        # Fallback: lines between joint centres, padded by `margin`
+        capsules = [(i, p0, p1, margin) for i, p0, p1 in _segments_from_poses(poses, ignore_links)]
 
     tool_segments = getattr(robot, 'collision_tool_segments', None)
     if tool_segments:
@@ -187,6 +204,30 @@ def _other_robot_capsules(other, margin):
     return caps
 
 
+def hull_box_overlap(V_world, N_world, box, clearance=0.0):
+    """Does a convex hull touch the box (grown by `clearance`)?
+
+    Separating-axis test using the box's 3 axes and the hull's face normals.
+    (Edge-edge axes are skipped, which can only report extra overlaps, never
+    miss a real one - so it errs on the safe side.)
+    """
+    axes = np.vstack([box['R'].T, N_world])                 # (k,3)
+    proj = V_world @ axes.T                                 # hull projected on each axis
+    h_min, h_max = proj.min(axis=0), proj.max(axis=0)
+    c = axes @ box['centre']
+    r = np.abs(axes @ box['R']) @ (box['half'] + clearance)  # box half-extent along each axis
+    separated = (h_min > c + r) | (h_max < c - r)
+    return not np.any(separated)
+
+
+def _link_hull_hits_box(robot, poses, k, box):
+    """Second-stage check of link k against a box, using its convex hull."""
+    V, N, pad = robot.collision_link_hulls[k]
+    T = poses[k]
+    R, t = T[:3, :3], T[:3, 3]
+    return hull_box_overlap(V @ R.T + t, N @ R.T, box, HULL_CLEARANCE + pad)
+
+
 def _capsule_aabbs(capsules):
     """(N,3) min and max corners of each capsule's bounding box."""
     p0 = np.array([c[1] for c in capsules])
@@ -199,20 +240,41 @@ def _collision_pairs(robot, q, vertices, other_robots, margin, ignore_links,
                      obstacle_names=None, stop_at_first=True):
     """Core check. Returns a list of (my_label, what_was_hit, contact_point)."""
     hits = []
+
+    # 0. Optional rule the moving robot must obey (e.g. "keep the glass upright").
+    #    Set robot.path_constraint = f(q) -> True if allowed. A pose that breaks it
+    #    is treated like a collision, so IK, path checks and RRT all avoid it.
+    constraint = getattr(robot, 'path_constraint', None)
+    if constraint is not None and not constraint(q):
+        name = getattr(constraint, '__name__', 'path constraint')
+        hits.append(('constraint', name, get_link_poses(robot, q)[-1][:3, 3]))
+        return hits
     all_capsules = get_collision_capsules(robot, q, margin, ignore_links=())   # one fkine
     my_capsules = [c for c in all_capsules if c[0] not in ignore_links]
+    hulls = getattr(robot, 'collision_link_hulls', None)
+    poses = get_link_poses(robot, q) if hulls else None
+    hull_verdict = {}                 # (link, box index) -> precise answer, computed once
 
     # 1. Robot (links + tool) vs static obstacle boxes
+    #    Stage 1: capsules (fast, a bit fat). Stage 2: if a link's capsule touches
+    #    a box, its convex hull decides (precise to a few mm).
     if vertices is not None and len(vertices) > 0:
         boxes = _cached_boxes(vertices)
         names = obstacle_names or [f"obstacle_{k}" for k in range(len(boxes))]
         for label, p0, p1, rad in my_capsules:
-            for name, box in zip(names, boxes):
+            for bi, (name, box) in enumerate(zip(names, boxes)):
                 hit, point = segment_box_intersection(p0, p1, box, rad)
-                if hit:
-                    hits.append((label, name, point))
-                    if stop_at_first:
-                        return hits
+                if not hit:
+                    continue
+                if hulls and isinstance(label, (int, np.integer)) and label < len(hulls):
+                    key = (label, bi)
+                    if key not in hull_verdict:
+                        hull_verdict[key] = _link_hull_hits_box(robot, poses, label, box)
+                    if not hull_verdict[key]:
+                        continue          # capsule touched, the real link shape doesn't
+                hits.append((label, name, point))
+                if stop_at_first:
+                    return hits
 
     # 2. Robot vs other robots, at the other robots' CURRENT joint angles.
     #    Base columns are included here: another arm can hit them.
@@ -380,7 +442,7 @@ class _Tree:
 
 def find_collision_free_path_rrt(robot, q_start, q_goal, faces, vertices, face_normals,
                                  env=None, collisions_list=None,
-                                 max_iterations=3000, step_size=0.3,
+                                 max_iterations=8000, step_size=0.3,
                                  goal_sample_rate=0.1, goal_threshold=0.3,
                                  visualize=False, other_robots=None,
                                  resolution=DEFAULT_EDGE_RESOLUTION,
@@ -412,6 +474,13 @@ def find_collision_free_path_rrt(robot, q_start, q_goal, faces, vertices, face_n
         return not check_line_collision(robot, a, b, faces, vertices, face_normals,
                                         other_robots=other_robots, resolution=resolution)
 
+    # If the robot has a path constraint, it can supply robot.project_to_constraint(q)
+    # -> nearby q that obeys it (or None). Random samples almost never obey a
+    # constraint like "glass upright", so every new node is pulled onto it.
+    project = getattr(robot, 'project_to_constraint', None)
+    if getattr(robot, 'path_constraint', None) is None:
+        project = None
+
     print(f"Starting RRT-Connect search (max {max_iterations} iterations, {max_time:.0f}s)...")
     if collides(q_start):
         print("Start configuration is in collision!")
@@ -437,7 +506,7 @@ def find_collision_free_path_rrt(robot, q_start, q_goal, faces, vertices, face_n
         for it in range(budget):
             if time.time() - t0 > max_time:
                 break
-            q_rand = rng.uniform(lo, hi)
+            q_rand = rng.uniform(lo, hi)        # only sets a direction to grow in
 
             # EXTEND tree_a one step towards the sample
             i_near = tree_a.nearest(q_rand)
@@ -445,19 +514,29 @@ def find_collision_free_path_rrt(robot, q_start, q_goal, faces, vertices, face_n
             d = q_rand - q_near
             dist = np.linalg.norm(d)
             q_new = q_rand if dist <= step_size else q_near + d / dist * step_size
-            if not edge_free(q_near, q_new):
+            if project is not None and dist > step_size:
+                q_new = project(q_new)
+            if q_new is None or not edge_free(q_near, q_new):
                 tree_a, tree_b, a_is_start = tree_b, tree_a, not a_is_start
                 continue
             i_new = tree_a.add(q_new, i_near)
 
-            # CONNECT: tree_b keeps stepping towards q_new until blocked or joined
+            # CONNECT: tree_b keeps stepping towards q_new until blocked or joined.
+            # Each step must get closer (a constraint projection can push sideways),
+            # and the number of steps is capped so this can never loop forever.
             j = tree_b.nearest(q_new)
-            while True:
+            last_dist = np.inf
+            for _ in range(200):
                 q_b = tree_b.Q[j]
                 d = q_new - q_b
                 dist = np.linalg.norm(d)
+                if dist >= last_dist - 1e-3 or time.time() - t0 > max_time:
+                    break                      # not making progress
+                last_dist = dist
                 q_step = q_new if dist <= step_size else q_b + d / dist * step_size
-                if not edge_free(q_b, q_step):
+                if project is not None and dist > step_size:
+                    q_step = project(q_step)
+                if q_step is None or not edge_free(q_b, q_step):
                     break
                 j = tree_b.add(q_step, j)
                 if dist <= step_size:          # trees joined
