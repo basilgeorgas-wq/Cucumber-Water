@@ -28,8 +28,12 @@ def ikine_move(robot, target_pose, env=None, q0=None,
                other_robots=None,
                # Orientation parameters
                orientation_tolerance=DEFAULT_ORIENTATION_TOLERANCE,
-               position_only=False):
+               position_only=False, preferred_q=None):
     """Joint-space move to target_pose.
+
+    preferred_q           : optional joint configuration to aim for (e.g. from
+                            find_approach_configuration); otherwise the solution
+                            nearest the current joints is used
 
     orientation_tolerance : max orientation error in radians (default 1 deg)
     position_only         : True to ignore orientation entirely (only if the
@@ -61,6 +65,10 @@ def ikine_move(robot, target_pose, env=None, q0=None,
     # ========== PHASE 1: Solve IK for target ==========
     #Create varied initial guesses - current, zero, random
     initial_guesses = generate_ik_initial_guesses(robot, q_start, max_attempts)
+    q_reference = q_start
+    if preferred_q is not None:
+        initial_guesses = [np.array(preferred_q, dtype=float)] + initial_guesses
+        q_reference = np.array(preferred_q, dtype=float)
     
     # Solve IK: full pose (unless position_only), within joint limits,
     # collision-free, and closest to the current joints
@@ -70,7 +78,7 @@ def ikine_move(robot, target_pose, env=None, q0=None,
         check_collision_fn=collision_check_fn if stop_on_collision else None,
         orientation_tolerance=orientation_tolerance,
         position_only=position_only,
-        q_reference=q_start
+        q_reference=q_reference
     )
     
     #Logging
@@ -815,9 +823,11 @@ def solve_ik_with_strategies(robot, T_target, initial_guesses,
             break
 
     if valid:
-        _, q, pos_err, ori_err = min(valid, key=lambda v: v[0])
+        valid.sort(key=lambda v: v[0])
+        _, q, pos_err, ori_err = valid[0]
         return {'success': True, 'q': q, 'error': pos_err, 'ori_error': ori_err,
-                'attempts': attempts, 'collision_free': True, 'reason': None}
+                'attempts': attempts, 'collision_free': True, 'reason': None,
+                'solutions': [v[1] for v in valid]}   # every valid solution, nearest first
 
     # Nothing valid: report the most useful reason
     if rejected['collision'] > 0:
@@ -844,7 +854,8 @@ def solve_ik_with_strategies(robot, T_target, initial_guesses,
                 reason = 'orientation'
                 break
     return {'success': False, 'q': None, 'error': best_pos, 'ori_error': best_ori,
-            'attempts': attempts, 'collision_free': reason != 'collision', 'reason': reason}
+            'attempts': attempts, 'collision_free': reason != 'collision', 'reason': reason,
+            'solutions': []}
 
 
 def describe_ik_failure(result, tolerance, orientation_tolerance):
@@ -860,6 +871,51 @@ def describe_ik_failure(result, tolerance, orientation_tolerance):
                 "if the tool direction doesn't matter for this move")
     return (f"target out of reach (closest {result['error']*1000:.1f} mm, "
             f"limit {tolerance*1000:.1f} mm)")
+
+
+def find_approach_configuration(robot, T_approach, T_final, q_start,
+                                faces=None, vertices=None, face_normals=None,
+                                other_robots=None, steps=10, tolerance=0.005,
+                                orientation_tolerance=DEFAULT_ORIENTATION_TOLERANCE,
+                                max_joint_step=np.deg2rad(20), max_attempts=40):
+    """Joint configuration at T_approach from which a straight line to T_final works.
+
+    Use before a pick/place: the arm configuration chosen at the approach point
+    decides whether the straight descent is possible (e.g. elbow-down shapes
+    can sweep the upper arm into the bench). This solves T_final first, then
+    walks back up the line, so the returned configuration is guaranteed to have
+    a reachable, collision-free, flip-free straight path down.
+
+    Returns the joint vector at T_approach, or None if no such path exists.
+    """
+    check = vertices is not None
+    def collides(q):
+        return check and check_single_config_collision(
+            robot, q, faces, vertices, face_normals, return_once_found=True,
+            other_robots=other_robots)[0]
+
+    final = solve_ik_with_strategies(
+        robot, T_final, generate_ik_initial_guesses(robot, q_start, max_attempts),
+        tolerance=tolerance, check_collision_fn=collides,
+        orientation_tolerance=orientation_tolerance, q_reference=q_start,
+        max_solutions=max_attempts)
+
+    for q_final in final['solutions']:            # nearest-to-current first
+        q = q_final
+        ok = True
+        for k in range(1, steps):
+            T = T_final.interp(T_approach, k / (steps - 1))
+            r = solve_ik_with_strategies(robot, T, [q], tolerance=tolerance,
+                                         check_collision_fn=collides,
+                                         orientation_tolerance=orientation_tolerance,
+                                         q_reference=q, max_solutions=1)
+            if not r['success'] or np.max(np.abs(r['q'] - q)) > max_joint_step:
+                ok = False
+                break
+            q = r['q']
+        if ok:
+            return q
+    return None
 
 
 def check_target_reachable(robot, T_target, q_start, tolerance=0.01,

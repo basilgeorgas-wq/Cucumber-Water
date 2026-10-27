@@ -23,7 +23,8 @@ from DOBOT_CR5 import DOBOT_CR5
 from MOTOMAN_GP4 import MOTOMAN_GP4
 
 from environment_controller import Environment_Manager
-from movement_handler import ikine_move, rmrc_move, linear_move, start_joystick_control, create_linear_path
+from movement_handler import (ikine_move, rmrc_move, linear_move, start_joystick_control,
+                              create_linear_path, find_approach_configuration)
 
 class TaskSimulation():
     def __init__(self):
@@ -254,6 +255,21 @@ class TaskSimulation():
         self.step_log.append((label, success))
         return success
 
+    def _move_above(self, label, robot, T_above, T_down):
+        """Go to T_above in an arm shape that can then move straight down to T_down."""
+        if not self.check_pause():
+            return False
+        kw = self._move_kwargs
+        q_hint = find_approach_configuration(
+            robot, T_above, T_down, robot.q,
+            faces=kw['faces'], vertices=kw['vertices'], face_normals=kw['face_normals'],
+            other_robots=kw['other_robots'])
+        if q_hint is None:
+            print(f"{label}: no arm configuration allows a clear straight descent")
+            self.step_log.append((label, False))
+            return False
+        return self._move(label, robot, T_above, preferred_q=q_hint)
+
     def _dobot_flange_for_glass(self, glass_position, yaw):
         """Flange pose that puts the glass centre at glass_position."""
         T_grip = self.grip_facing(yaw)
@@ -336,8 +352,9 @@ class TaskSimulation():
         print("Omron picking up the slice")
         sx, sy, sz = self.SLICE_POSITION
         pick_z = sz + env_mgr.SLICE_RADIUS + 0.005 + self.GRIPPER_LENGTH_OMRON
-        above_ok = self._move("Omron above slice", self.OMRON,
-                              SE3(sx, sy, pick_z + self.APPROACH_HEIGHT) * self.TOOL_DOWN)
+        above_ok = self._move_above("Omron above slice", self.OMRON,
+                                    SE3(sx, sy, pick_z + self.APPROACH_HEIGHT) * self.TOOL_DOWN,
+                                    SE3(sx, sy, pick_z) * self.TOOL_DOWN)
         picked = above_ok and self._move("Omron pick slice", self.OMRON,
                                          SE3(sx, sy, pick_z) * self.TOOL_DOWN, linear=True,
                                          steps=10, position_tolerance=0.005)
@@ -352,8 +369,9 @@ class TaskSimulation():
             print("Omron putting the slice in the glass")
             gx, gy, gz = self.HANDOVER_GLASS_POSITION
             drop_z = gz + H / 2 + self.DROP_CLEARANCE + self.GRIPPER_LENGTH_OMRON
-            over = self._move("Omron above glass", self.OMRON,
-                              SE3(gx, gy, drop_z + self.APPROACH_HEIGHT) * self.TOOL_DOWN)
+            over = self._move_above("Omron above glass", self.OMRON,
+                                    SE3(gx, gy, drop_z + self.APPROACH_HEIGHT) * self.TOOL_DOWN,
+                                    SE3(gx, gy, drop_z) * self.TOOL_DOWN)
             dropped = over and self._move("Omron lower to glass", self.OMRON,
                                           SE3(gx, gy, drop_z) * self.TOOL_DOWN, linear=True,
                                           steps=10, position_tolerance=0.005)
