@@ -150,10 +150,11 @@ def build(robot, mesh_dir, mesh_names):
 
 def build_gripper(gripper_dir, name):
     """Collision shapes for a gripper, in the gripper's own frame (mount face at
-    z = 0, fingers along +z). Covers both the open and the gripping finger
-    positions, so it stays valid whichever state the gripper is in."""
-    P = np.vstack([trimesh.load(os.path.join(gripper_dir, f"{name}_{state}.stl")).vertices
-                   for state in ("open", "grip")])
+    z = 0, fingers along +z). Covers every finger position (<name>_*.stl), so it
+    stays valid whichever state the gripper is in."""
+    import glob
+    P = np.vstack([trimesh.load(path).vertices
+                   for path in sorted(glob.glob(os.path.join(gripper_dir, f"{name}_*.stl")))])
     caps = fit_capsules(P)
     hull = simplified_hull(P)
     out = os.path.join(gripper_dir, f"{name}_collision.json")

@@ -6,9 +6,9 @@ Used by robot_controller/gripper.py.
 
 | File | What it is |
 |---|---|
-| robotiq_2f85_open.stl / _grip.stl | Robotiq 2F-85: fully open (8.5 cm) / closed on the 1.1 cm cucumber slice |
+| robotiq_2f85_open.stl / _grip.stl / _grip_cucumber.stl | Robotiq 2F-85: fully open (8.5 cm) / closed on the 1.1 cm cucumber slice / closed on the 3.8 cm cucumber |
 | dh_ag95_open.stl / _grip.stl | DH Robotics AG-95: fully open (9.5 cm) / closed on the 7.2 cm glass |
-| *_collision.json | Collision capsules + convex hull covering both finger states (made by make_collision_capsules.py) |
+| *_collision.json | Collision capsules + convex hull covering every finger position (made by make_collision_capsules.py) |
 
 ## Sources and licences
 

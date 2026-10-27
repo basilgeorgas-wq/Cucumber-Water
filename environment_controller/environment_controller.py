@@ -13,7 +13,10 @@ class Environment_Manager():
         self.env = env
         self.obstacles = []  # Store obstacle data
         
-        self.add_cucumber(-0.8, -0.2, 0.94)
+        # Cucumber starts on the fridge's top shelf, lying front-to-back with its
+        # front end sticking out past the shelf edge (that's where the Omron grips it)
+        x, y, z = self.cucumber_fridge_origin()
+        self.add_cucumber(x, y, z, rotz=pi / 2)
         self.add_enclosure(0, 0, 0)
 
         # Bench hitbox
@@ -53,25 +56,28 @@ class Environment_Manager():
                                               z_length=lz, env=self.env, name=name)
             self.obstacles.append({'name': name, 'vertices': v, 'faces': f, 'face_normals': n})
 
-        # Fridge body hitbox
-        fridge, fridge_vertices, fridge_faces, fridge_normals = self.create_obstacle(
-            x=-0.6, y=0.75, z=0.8,
-            x_length=0.7, y_length=0.7, z_length=1.7,
-            env=self.env,
-            name="fridge"
-        )
-        self.obstacles.append({
-            'name': 'fridge',
-            'vertices': fridge_vertices,
-            'faces': fridge_faces,
-            'face_normals': fridge_normals
-        })
+        # Fridge (top freezer closed, fridge door open towards +x), matched to the
+        # kitchen model. Built from walls + shelves so the robots can reach inside.
+        fridge_parts = [
+            # name,              centre (x, y, z),            size (x, y, z)
+            ("fridge_back",       (-0.914, 0.7695, 0.85),     (0.118, 0.779, 1.70)),
+            ("fridge_side_near",  (-0.5865, 0.4165, 0.85),    (0.773, 0.073, 1.70)),
+            ("fridge_side_far",   (-0.5865, 1.1295, 0.85),    (0.773, 0.059, 1.70)),
+            ("fridge_freezer",    (-0.5865, 0.7695, 1.426),   (0.773, 0.779, 0.548)),
+            ("fridge_bottom",     (-0.5865, 0.7695, 0.155),   (0.773, 0.779, 0.31)),
+            ("fridge_top_shelf",  (-0.61, 0.7765, 0.823),     (0.49, 0.647, 0.014)),
+            ("fridge_mid_shelf",  (-0.61, 0.7765, 0.565),     (0.49, 0.647, 0.014)),
+        ]
+        for name, (cx, cy, cz), (lx, ly, lz) in fridge_parts:
+            _, v, f, n = self.create_obstacle(x=cx, y=cy, z=cz, x_length=lx, y_length=ly,
+                                              z_length=lz, env=self.env, name=name)
+            self.obstacles.append({'name': name, 'vertices': v, 'faces': f, 'face_normals': n})
 
-        # Fridge door hitbox
+        # Fridge door (open at -22 deg; 22 cm thick including the door bins)
         door, door_vertices, door_faces, door_normals = self.create_obstacle(
-            x=0.1, y=0.9, z=0.62,
-            rotx=0, roty=0, rotz=-28*pi/180,
-            x_length=0.7, y_length=0.1, z_length=1.1,
+            x=0.0745, y=0.9015, z=0.609,
+            rotx=0, roty=0, rotz=-22*pi/180,
+            x_length=0.70, y_length=0.22, z_length=1.13,
             env=self.env,
             name="fridge_door"
         )
@@ -82,13 +88,34 @@ class Environment_Manager():
             'face_normals': door_normals
         })
 
+    # cucumber_base.stl: 22.9 cm long along its y axis (from y=0 to 0.229), 3.8 cm thick
+    CUCUMBER_LENGTH = 0.229
+    CUCUMBER_RADIUS = 0.019
+
+    # Fridge top shelf (matches the fridge_top_shelf hitbox)
+    FRIDGE_SHELF_TOP = 0.830
+    FRIDGE_SHELF_FRONT = -0.365
+    CUCUMBER_FRIDGE_Y = 0.68         # how far along the shelf the cucumber lies
+    CUCUMBER_OVERHANG = 0.07         # how far its front end sticks out past the shelf edge
+
+    def cucumber_fridge_origin(self):
+        """Cucumber's front end (mesh origin) on the top shelf; the mesh points into the fridge."""
+        return (self.FRIDGE_SHELF_FRONT + self.CUCUMBER_OVERHANG, self.CUCUMBER_FRIDGE_Y,
+                self.FRIDGE_SHELF_TOP + self.CUCUMBER_RADIUS)
+
+    def cucumber_fridge_pose(self):
+        return SE3(*self.cucumber_fridge_origin()) * SE3.Rz(pi / 2)
+
     def add_cucumber(self, x, y, z, rotx=0.0, roty=0.0, rotz=0.0):
+        """Whole cucumber; (x, y, z) is the end at the mesh origin. Returns the mesh."""
         current_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visual_files")
         stl_path = os.path.join(current_dir, "cucumber_base.stl")
-        cucumber = geometry.Mesh(stl_path, pose=SE3(float(x), float(y), float(z))*SE3.Rx(rotx)*SE3.Ry(roty)*SE3.Rz(rotz), 
+        cucumber = geometry.Mesh(stl_path, pose=SE3(float(x), float(y), float(z))*SE3.Rx(rotx)*SE3.Ry(roty)*SE3.Rz(rotz),
         scale=[1.0, 1.0, 1.0], color=(0.0, 1.0, 0.0, 1.0))
         self.env.add(cucumber)
+        self.cucumber = cucumber
         print("Cucumber Added")
+        return cucumber
 
     # ---- Props the robots carry -------------------------------------------
     # glass-cup.stl is modelled 1.2 m wide x 1.5 m tall with its base at z=0,

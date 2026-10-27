@@ -478,7 +478,7 @@ def check_line_collision(robot, q1, q2, faces, vertices, face_normals, steps=Non
     q1, q2 = np.asarray(q1, float), np.asarray(q2, float)
     if steps is None:
         steps = max(1, int(np.ceil(np.max(np.abs(q2 - q1)) / resolution)))
-    for i in range(steps + 1):
+    for i in _bisection_order(steps):
         alpha = i / steps
         hit, _ = check_single_config_collision(
             robot, (1 - alpha) * q1 + alpha * q2, faces, vertices, face_normals,
@@ -486,6 +486,24 @@ def check_line_collision(robot, q1, q2, faces, vertices, face_normals, steps=Non
         if hit:
             return True
     return False
+
+
+def _bisection_order(steps):
+    """0..steps in the order end, start, middle, quarters, eighths ... A blocked line
+    is usually caught after a few checks instead of walking it end to end."""
+    order, seen = [steps, 0], {0, steps}
+    queue = [(0, steps)]
+    while queue:
+        nxt = []
+        for a, b in queue:
+            if b - a > 1:
+                m = (a + b) // 2
+                if m not in seen:
+                    seen.add(m)
+                    order.append(m)
+                nxt += [(a, m), (m, b)]
+        queue = nxt
+    return order
 
 
 class _Tree:
@@ -635,7 +653,7 @@ def find_collision_free_path_rrt(robot, q_start, q_goal, faces, vertices, face_n
 
 
 #Removes unnecessary waypoints
-def smooth_path(robot, path, faces, vertices, face_normals, max_attempts=100,
+def smooth_path(robot, path, faces, vertices, face_normals, max_attempts=40,
                 other_robots=None, resolution=DEFAULT_EDGE_RESOLUTION, seed=None):
     """Shorten a path: greedily skip to the furthest waypoint reachable in a
     straight (collision-free) line, then try some random shortcuts."""
