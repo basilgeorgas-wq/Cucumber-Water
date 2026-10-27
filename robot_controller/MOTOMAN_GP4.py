@@ -6,6 +6,7 @@ import spatialmath.base as spb
 from spatialmath import SE3
 from ir_support.robots.DHRobot3D import DHRobot3D
 from attachments import AttachmentMixin
+from collision_model import load_collision_capsules
 import time
 import os
 
@@ -46,6 +47,9 @@ class MOTOMAN_GP4(AttachmentMixin, DHRobot3D):
         
         current_path = os.path.join(os.path.dirname(__file__), 'Motoman_GP4_stl')
         super().__init__(links, link3D_names, name = 'Motoman_GP4', link3d_dir = current_path, qtest = qtest, qtest_transforms = qtest_transforms)
+        # Collision capsules fitted to the 3D meshes (see make_collision_capsules.py)
+        load_collision_capsules(self, current_path,
+                                [link3D_names[f'link{k}'] for k in range(self.n + 1)])
         self.q = qtest
         
         # File is 'Knife.dae' (capital K) - case matters on Linux/macOS

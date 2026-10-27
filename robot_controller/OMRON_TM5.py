@@ -7,6 +7,7 @@ import spatialmath.base as spb
 from spatialmath import SE3
 from ir_support.robots.DHRobot3D import DHRobot3D
 from attachments import AttachmentMixin
+from collision_model import load_collision_capsules
 import time
 import os
 from roboticstoolbox import DHLink, DHRobot, jtraj
@@ -67,6 +68,9 @@ class OMRON_TM5_700(AttachmentMixin, DHRobot3D):
         
         current_path = os.path.join(os.path.dirname(__file__), 'Omron_T5_stl')
         super().__init__(links, link3D_names, name = 'OMRON_TM5', link3d_dir = current_path, qtest = qtest, qtest_transforms = qtest_transforms)
+        # Collision capsules fitted to the 3D meshes (see make_collision_capsules.py)
+        load_collision_capsules(self, current_path,
+                                [link3D_names[f'link{k}'] for k in range(self.n + 1)])
         self.q = qtest
 
     # -----------------------------------------------------------------------------------#
