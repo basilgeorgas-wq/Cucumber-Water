@@ -1,5 +1,6 @@
 import os
 import swift
+import swift_windows_fix  # noqa: F401  - fixes Swift's "404 File not found" for meshes on Windows
 import sys
 from pathlib import Path
 from spatialmath import SE3
