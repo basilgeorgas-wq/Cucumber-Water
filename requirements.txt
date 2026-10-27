@@ -1,0 +1,18 @@
+# Tested versions for Cucumber-Water (Python 3.11, Windows)
+# Install with:
+#   py -3.11 -m pip install --only-binary :all: -r requirements.txt
+#   py -3.11 -m pip install --no-deps ir-support==1.4.3
+# Note: spatialgeometry 1.4.x does NOT work with swift-sim 1.1.0 (browser crashes),
+# so roboticstoolbox/spatialgeometry are held at 1.1.0.
+roboticstoolbox-python==1.1.0
+spatialgeometry==1.1.0
+swift-sim==1.1.0
+spatialmath-python==1.1.14
+numpy==1.26.4
+scipy==1.11.4
+matplotlib==3.10.7
+pygame==2.6.1
+keyboard==0.13.5
+websockets==13.1
+plyfile==1.1.3
+trimesh==4.8.3
