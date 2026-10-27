@@ -159,15 +159,52 @@ def _mark_collision(point, env, collisions_list):
         collisions_list.append(new_collision)
 
 
+_capsule_cache = {}      # other robots don't move while one robot plans: reuse their capsules
+_box_cache = {}
+
+
+def _cached_boxes(vertices):
+    key = (id(vertices), np.shape(vertices))
+    boxes = _box_cache.get(key)
+    if boxes is None:
+        boxes = boxes_from_vertices(vertices)
+        _box_cache.clear()
+        _box_cache[key] = boxes
+    return boxes
+
+
+def _other_robot_capsules(other, margin):
+    """Capsules of a robot at its current pose, cached until it moves."""
+    tool = getattr(other, 'collision_tool_segments', None)
+    key = (id(other), np.asarray(other.q, float).tobytes(), np.asarray(other.base).tobytes(),
+           id(tool), len(tool) if tool else 0, margin)
+    caps = _capsule_cache.get(key)
+    if caps is None:
+        caps = get_collision_capsules(other, other.q, margin, ignore_links=())
+        if len(_capsule_cache) > 32:
+            _capsule_cache.clear()
+        _capsule_cache[key] = caps
+    return caps
+
+
+def _capsule_aabbs(capsules):
+    """(N,3) min and max corners of each capsule's bounding box."""
+    p0 = np.array([c[1] for c in capsules])
+    p1 = np.array([c[2] for c in capsules])
+    r = np.array([c[3] for c in capsules])[:, None]
+    return np.minimum(p0, p1) - r, np.maximum(p0, p1) + r
+
+
 def _collision_pairs(robot, q, vertices, other_robots, margin, ignore_links,
                      obstacle_names=None, stop_at_first=True):
-    """Core check. Yields (my_label, what_was_hit, contact_point)."""
+    """Core check. Returns a list of (my_label, what_was_hit, contact_point)."""
     hits = []
-    my_capsules = get_collision_capsules(robot, q, margin, ignore_links)
+    all_capsules = get_collision_capsules(robot, q, margin, ignore_links=())   # one fkine
+    my_capsules = [c for c in all_capsules if c[0] not in ignore_links]
 
     # 1. Robot (links + tool) vs static obstacle boxes
     if vertices is not None and len(vertices) > 0:
-        boxes = boxes_from_vertices(vertices)
+        boxes = _cached_boxes(vertices)
         names = obstacle_names or [f"obstacle_{k}" for k in range(len(boxes))]
         for label, p0, p1, rad in my_capsules:
             for name, box in zip(names, boxes):
@@ -179,13 +216,20 @@ def _collision_pairs(robot, q, vertices, other_robots, margin, ignore_links,
 
     # 2. Robot vs other robots, at the other robots' CURRENT joint angles.
     #    Base columns are included here: another arm can hit them.
-    for other in (other_robots or []):
-        if other is robot:
-            continue
-        mine_all = get_collision_capsules(robot, q, margin, ignore_links=())
-        theirs = get_collision_capsules(other, other.q, margin, ignore_links=())
-        for label, a0, a1, ra in mine_all:
-            for olabel, b0, b1, rb in theirs:
+    others = [o for o in (other_robots or []) if o is not robot]
+    if others and all_capsules:
+        a_lo, a_hi = _capsule_aabbs(all_capsules)
+        for other in others:
+            theirs = _other_robot_capsules(other, margin)
+            if not theirs:
+                continue
+            b_lo, b_hi = _capsule_aabbs(theirs)
+            # Broad phase: only pairs whose bounding boxes overlap can touch
+            overlap = np.all((a_lo[:, None, :] <= b_hi[None, :, :]) &
+                             (b_lo[None, :, :] <= a_hi[:, None, :]), axis=2)
+            for i, j in zip(*np.nonzero(overlap)):
+                label, a0, a1, ra = all_capsules[i]
+                olabel, b0, b1, rb = theirs[j]
                 dist, c1, c2 = segment_segment_distance(a0, a1, b0, b1)
                 if dist < ra + rb:
                     hits.append((label, f"{other.name}:{olabel}", (c1 + c2) / 2))
@@ -277,199 +321,218 @@ def get_link_poses(robot, q=None):
         return robot.fkine_all().A
     return robot.fkine_all(q).A
 
-#RRT Pathfinding 
-def find_collision_free_path_rrt(robot, q_start, q_goal, faces, vertices, face_normals,
-                                 env=None, collisions_list=None,
-                                 max_iterations=1000, step_size=0.2, 
-                                 goal_sample_rate=0.1, goal_threshold=0.3,
-                                 visualize=False, other_robots=None):
-    
-    print(f"Starting RRT search (max iterations: {max_iterations})...")
-    
-    # Check if start and goal are collision-free
-    start_collision, _ = check_single_config_collision(
-        robot, q_start, faces, vertices, face_normals, return_once_found=True,
-        other_robots=other_robots
-    )
-    
-    goal_collision, _ = check_single_config_collision(
-        robot, q_goal, faces, vertices, face_normals, return_once_found=True,
-        other_robots=other_robots
-    )
-    
-    if start_collision:
-        print("Start configuration is in collision!")
-        return [], False
-    
-    if goal_collision:
-        print("Goal configuration is in collision!")
-        return [], False
-    
-    # Initialize tree
-    tree = [{'q': np.array(q_start), 'parent': None, 'cost': 0}]
-    
-    # Get joint limits
-    q_min = np.array([robot.links[i].qlim[0] if hasattr(robot.links[i], 'qlim') and robot.links[i].qlim is not None else -np.pi 
-                     for i in range(robot.n)])
-    q_max = np.array([robot.links[i].qlim[1] if hasattr(robot.links[i], 'qlim') and robot.links[i].qlim is not None else np.pi 
-                     for i in range(robot.n)])
-    
-    start_time = time.time()
-    
-    for iteration in range(max_iterations):
-        # Sample random configuration (bias toward goal)
-        if np.random.random() < goal_sample_rate:
-            q_rand = q_goal
-        else:
-            q_rand = np.random.uniform(q_min, q_max)
-        
-        # Find nearest node in tree
-        nearest_idx = 0
-        min_dist = np.linalg.norm(tree[0]['q'] - q_rand)
-        
-        for i, node in enumerate(tree):
-            dist = np.linalg.norm(node['q'] - q_rand)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_idx = i
-        
-        q_near = tree[nearest_idx]['q']
-        
-        # Extend toward sample
-        direction = q_rand - q_near
-        dist = np.linalg.norm(direction)
-        
-        if dist > step_size:
-            direction = direction / dist * step_size
-        
-        q_new = q_near + direction
-        
-        # Clip to joint limits
-        q_new = np.clip(q_new, q_min, q_max)
-        
-        # Check if extension is collision-free
-        collision = check_line_collision(
-            robot, q_near, q_new, faces, vertices, face_normals, steps=5,
-            other_robots=other_robots
-        )
-        
-        if not collision:
-            # Add to tree
-            new_cost = tree[nearest_idx]['cost'] + np.linalg.norm(q_new - q_near)
-            tree.append({'q': q_new, 'parent': nearest_idx, 'cost': new_cost})
-            
-            # Visualize if requested
-            if visualize and env is not None and iteration % 50 == 0:
-                sphere = Sphere(radius=0.02, color=[0.0, 0.5, 1.0, 0.3])
-                T = robot.fkine(q_new).A
-                sphere.T = T
-                env.add(sphere)
-                env.step(0.01)
-            
-            # Check if goal reached
-            dist_to_goal = np.linalg.norm(q_new - q_goal)
-            if dist_to_goal < goal_threshold:
-                # Try direct connection to goal
-                collision = check_line_collision(
-                    robot, q_new, q_goal, faces, vertices, face_normals, steps=10,
-                    other_robots=other_robots
-                )
-                
-                if not collision:
-                    # Add goal to tree
-                    goal_cost = tree[-1]['cost'] + dist_to_goal
-                    tree.append({'q': np.array(q_goal), 'parent': len(tree) - 1, 'cost': goal_cost})
-                    
-                    # Extract path
-                    path = extract_path(tree)
-                    
-                    elapsed = time.time() - start_time
-                    print(f"✓ RRT succeeded in {iteration + 1} iterations ({elapsed:.2f}s)")
-                    print(f"  Path length: {len(path)} waypoints")
-                    
-                    # Smooth path
-                    path = smooth_path(robot, path, faces, vertices, face_normals,
-                                       other_robots=other_robots)
-                    print(f"  Smoothed to: {len(path)} waypoints")
-                    
-                    return path, True
-        
-        # Progress update
-        if iteration % 100 == 0 and iteration > 0:
-            print(f"  Iteration {iteration}/{max_iterations} (tree size: {len(tree)})")
-    
-    elapsed = time.time() - start_time
-    print(f"✗ RRT failed after {max_iterations} iterations ({elapsed:.2f}s)")
-    print(f"  Final tree size: {len(tree)}")
-    
-    return [], False
+# ---------------------------------------------------------------------------
+# Path planning: RRT-Connect in joint space
+# ---------------------------------------------------------------------------
+DEFAULT_EDGE_RESOLUTION = np.deg2rad(2.0)   # max joint change between collision checks
 
-def check_line_collision(robot, q1, q2, faces, vertices, face_normals, steps=10,
-                         other_robots=None):
+
+def _joint_limits(robot):
+    qlim = np.zeros((2, robot.n))
+    for j in range(robot.n):
+        lim = getattr(robot.links[j], 'qlim', None)
+        qlim[:, j] = [-np.pi, np.pi] if lim is None or np.any(np.isnan(lim)) else lim
+    return qlim
+
+
+def check_line_collision(robot, q1, q2, faces, vertices, face_normals, steps=None,
+                         other_robots=None, resolution=DEFAULT_EDGE_RESOLUTION):
+    """True if the straight joint-space line q1 -> q2 hits anything.
+
+    Checked every `resolution` radians of the largest joint change (or at a
+    fixed number of `steps` if given), so long lines are never under-sampled.
+    """
+    q1, q2 = np.asarray(q1, float), np.asarray(q2, float)
+    if steps is None:
+        steps = max(1, int(np.ceil(np.max(np.abs(q2 - q1)) / resolution)))
     for i in range(steps + 1):
         alpha = i / steps
-        q_interp = (1 - alpha) * np.array(q1) + alpha * np.array(q2)
-        
-        collision, _ = check_single_config_collision(
-            robot, q_interp, faces, vertices, face_normals, return_once_found=True,
-            other_robots=other_robots
-        )
-        
-        if collision:
+        hit, _ = check_single_config_collision(
+            robot, (1 - alpha) * q1 + alpha * q2, faces, vertices, face_normals,
+            return_once_found=True, other_robots=other_robots)
+        if hit:
             return True
-    
     return False
 
-def extract_path(tree):
-    path = []
-    current_idx = len(tree) - 1  # Goal node
-    
-    while current_idx is not None:
-        path.append(tree[current_idx]['q'])
-        current_idx = tree[current_idx]['parent']
-    
-    path.reverse()
-    return path
+
+class _Tree:
+    """RRT tree with vectorised nearest-neighbour lookup."""
+    def __init__(self, q_root):
+        self.Q = [np.asarray(q_root, float)]
+        self.parent = [-1]
+
+    def nearest(self, q):
+        d = np.linalg.norm(np.asarray(self.Q) - q, axis=1)
+        return int(np.argmin(d))
+
+    def add(self, q, parent):
+        self.Q.append(np.asarray(q, float))
+        self.parent.append(parent)
+        return len(self.Q) - 1
+
+    def path_to_root(self, idx):
+        path = []
+        while idx != -1:
+            path.append(self.Q[idx])
+            idx = self.parent[idx]
+        return path
+
+
+def find_collision_free_path_rrt(robot, q_start, q_goal, faces, vertices, face_normals,
+                                 env=None, collisions_list=None,
+                                 max_iterations=3000, step_size=0.3,
+                                 goal_sample_rate=0.1, goal_threshold=0.3,
+                                 visualize=False, other_robots=None,
+                                 resolution=DEFAULT_EDGE_RESOLUTION,
+                                 max_time=60.0, sample_margin=np.pi / 2, seed=None):
+    """Plan a collision-free joint-space path with RRT-Connect.
+
+    Two trees grow, one from the start and one from the goal, and try to join
+    each other every iteration - far better than a single tree at getting
+    through narrow gaps (e.g. under the cupboard).
+
+    Sampling first stays inside a box around start and goal (+/- sample_margin
+    per joint, within joint limits); if that fails, it widens to the full limits.
+
+    Returns (waypoints, success). Waypoints run start -> goal; every straight
+    segment between them has been collision-checked at `resolution`.
+    (goal_sample_rate / goal_threshold / visualize are kept for compatibility.)
+    """
+    rng = np.random.default_rng(seed)
+    q_start = np.asarray(q_start, float)
+    q_goal = np.asarray(q_goal, float)
+    qlim = _joint_limits(robot)
+
+    def collides(q):
+        return check_single_config_collision(robot, q, faces, vertices, face_normals,
+                                             return_once_found=True,
+                                             other_robots=other_robots)[0]
+
+    def edge_free(a, b):
+        return not check_line_collision(robot, a, b, faces, vertices, face_normals,
+                                        other_robots=other_robots, resolution=resolution)
+
+    print(f"Starting RRT-Connect search (max {max_iterations} iterations, {max_time:.0f}s)...")
+    if collides(q_start):
+        print("Start configuration is in collision!")
+        return [], False
+    if collides(q_goal):
+        print("Goal configuration is in collision!")
+        return [], False
+    if edge_free(q_start, q_goal):
+        print("Direct path is already collision-free")
+        return [q_start, q_goal], True
+
+    # Sampling regions: near start/goal first, then everything
+    lo_near = np.maximum(qlim[0], np.minimum(q_start, q_goal) - sample_margin)
+    hi_near = np.minimum(qlim[1], np.maximum(q_start, q_goal) + sample_margin)
+    regions = [(lo_near, hi_near), (qlim[0], qlim[1])]
+
+    t0 = time.time()
+    for phase, (lo, hi) in enumerate(regions):
+        tree_a, tree_b = _Tree(q_start), _Tree(q_goal)
+        a_is_start = True
+        budget = max_iterations // len(regions)
+
+        for it in range(budget):
+            if time.time() - t0 > max_time:
+                break
+            q_rand = rng.uniform(lo, hi)
+
+            # EXTEND tree_a one step towards the sample
+            i_near = tree_a.nearest(q_rand)
+            q_near = tree_a.Q[i_near]
+            d = q_rand - q_near
+            dist = np.linalg.norm(d)
+            q_new = q_rand if dist <= step_size else q_near + d / dist * step_size
+            if not edge_free(q_near, q_new):
+                tree_a, tree_b, a_is_start = tree_b, tree_a, not a_is_start
+                continue
+            i_new = tree_a.add(q_new, i_near)
+
+            # CONNECT: tree_b keeps stepping towards q_new until blocked or joined
+            j = tree_b.nearest(q_new)
+            while True:
+                q_b = tree_b.Q[j]
+                d = q_new - q_b
+                dist = np.linalg.norm(d)
+                q_step = q_new if dist <= step_size else q_b + d / dist * step_size
+                if not edge_free(q_b, q_step):
+                    break
+                j = tree_b.add(q_step, j)
+                if dist <= step_size:          # trees joined
+                    side_a = tree_a.path_to_root(i_new)[::-1]   # root_a ... q_new
+                    side_b = tree_b.path_to_root(j)             # q_new ... root_b
+                    path = side_a + side_b[1:]
+                    if not a_is_start:
+                        path = path[::-1]
+                    elapsed = time.time() - t0
+                    print(f"✓ RRT-Connect succeeded in {it + 1} iterations ({elapsed:.1f}s)"
+                          + (" after widening the search" if phase else ""))
+                    print(f"  Raw path: {len(path)} waypoints")
+                    path = smooth_path(robot, path, faces, vertices, face_normals,
+                                       other_robots=other_robots, resolution=resolution)
+                    print(f"  Shortened to: {len(path)} waypoints")
+                    return path, True
+
+            tree_a, tree_b, a_is_start = tree_b, tree_a, not a_is_start
+
+        if phase == 0:
+            print("  Not found near start/goal - widening search to full joint range")
+
+    print(f"✗ RRT-Connect failed ({time.time() - t0:.1f}s)")
+    return [], False
+
 
 #Removes unnecessary waypoints
 def smooth_path(robot, path, faces, vertices, face_normals, max_attempts=100,
-                other_robots=None):
+                other_robots=None, resolution=DEFAULT_EDGE_RESOLUTION, seed=None):
+    """Shorten a path: greedily skip to the furthest waypoint reachable in a
+    straight (collision-free) line, then try some random shortcuts."""
+    path = [np.asarray(q, float) for q in path]
     if len(path) <= 2:
         return path
-    
-    smoothed = path.copy()
-    
+
+    def free(a, b):
+        return not check_line_collision(robot, a, b, faces, vertices, face_normals,
+                                        other_robots=other_robots, resolution=resolution)
+
+    # Greedy pass
+    out = [path[0]]
+    i = 0
+    while i < len(path) - 1:
+        j = len(path) - 1
+        while j > i + 1 and not free(path[i], path[j]):
+            j -= 1
+        out.append(path[j])
+        i = j
+
+    # Random shortcuts between points along segments
+    rng = np.random.default_rng(seed)
     for _ in range(max_attempts):
-        if len(smoothed) <= 2:
+        if len(out) <= 2:
             break
-        
-        # Pick two random waypoints
-        i = np.random.randint(0, len(smoothed) - 2)
-        j = np.random.randint(i + 2, len(smoothed))
-        
-        # Try direct connection
-        collision = check_line_collision(
-            robot, smoothed[i], smoothed[j], 
-            faces, vertices, face_normals, steps=20,
-            other_robots=other_robots
-        )
-        
-        if not collision:
-            # Remove intermediate waypoints
-            smoothed = smoothed[:i+1] + smoothed[j:]
-    
-    return smoothed
+        i = rng.integers(0, len(out) - 2)
+        j = rng.integers(i + 2, len(out))
+        if free(out[i], out[j]):
+            out = out[:i + 1] + out[j:]
+    return out
+
 
 #Interpolates between waypoints
-def fine_interpolation(q1, q2, max_step_radians=np.deg2rad(1)):    
-    steps = 2
+def fine_interpolation(q1, q2, max_step_radians=np.deg2rad(1)):
+    # Quintic (jtraj) peaks at 1.875x the average speed, so start from that estimate
+    q1, q2 = np.asarray(q1, float), np.asarray(q2, float)
+    steps = max(2, int(np.ceil(1.875 * np.max(np.abs(q2 - q1)) / max_step_radians)) + 1)
     while np.any(max_step_radians < np.abs(np.diff(jtraj(q1, q2, steps).q, axis=0))):
         steps += 1
     return jtraj(q1, q2, steps).q
 def interpolate_waypoints(waypoint_list, max_step_radians=np.deg2rad(1)):
     q_matrix = []
     for i in range(len(waypoint_list) - 1):
-        for q in fine_interpolation(waypoint_list[i], waypoint_list[i+1], max_step_radians):
+        segment = fine_interpolation(waypoint_list[i], waypoint_list[i+1], max_step_radians)
+        # skip each segment's first point after the first (it repeats the previous end)
+        for q in (segment if i == 0 else segment[1:]):
             q_matrix.append(q)
     return q_matrix
 

@@ -10,7 +10,9 @@ import time
 from collision_handler import (
     check_single_config_collision, 
     is_collision,
-    find_collision_free_path_rrt
+    find_collision_free_path_rrt,
+    check_line_collision,
+    interpolate_waypoints
 )
 
 # A move only counts as successful if the tool ends within this angle of the
@@ -28,8 +30,12 @@ def ikine_move(robot, target_pose, env=None, q0=None,
                other_robots=None,
                # Orientation parameters
                orientation_tolerance=DEFAULT_ORIENTATION_TOLERANCE,
-               position_only=False, preferred_q=None):
+               position_only=False, preferred_q=None,
+               # Path planning (used when the straight path collides)
+               rrt_max_iterations=3000, rrt_max_time=60.0):
     """Joint-space move to target_pose.
+
+    rrt_max_iterations / rrt_max_time : search budget for the RRT path planner
 
     preferred_q           : optional joint configuration to aim for (e.g. from
                             find_approach_configuration); otherwise the solution
@@ -118,11 +124,17 @@ def ikine_move(robot, target_pose, env=None, q0=None,
     if check_collision:
         
         print("\nChecking trajectory for collisions...")
-        traj_collision = is_collision(
-            robot, list(q_matrix), faces, vertices, face_normals,
-            collisions_list=collisions_list, env=env, return_once_found=True,
+        # The joint-space move is a straight line q_start -> q_target, so check
+        # that line at fine resolution (not just at the animation frames)
+        traj_collision = check_line_collision(
+            robot, q_start, q_target, faces, vertices, face_normals,
             other_robots=other_robots
         )
+        if traj_collision and collisions_list is not None:
+            # drop a red marker where the straight path would hit
+            is_collision(robot, list(q_matrix), faces, vertices, face_normals,
+                         collisions_list=collisions_list, env=env, return_once_found=True,
+                         other_robots=other_robots)
         
         if traj_collision:
             print("Trajectory has collision")
@@ -131,18 +143,30 @@ def ikine_move(robot, target_pose, env=None, q0=None,
             if collision_free_search:
                 print("Searching for collision-free path with RRT...")
                 
-                q_path, rrt_success = find_collision_free_path_rrt(
-                    robot, q_start, q_target,
-                    faces, vertices, face_normals,
-                    env=env, collisions_list=collisions_list,
-                    max_iterations=1000,
-                    visualize=False,
-                    other_robots=other_robots
-                )
+                # Try the chosen goal first, then other valid arm shapes for the same pose
+                goals = [q_target] + [q for q in ik_result.get('solutions', [])
+                                      if not np.allclose(q, q_target)][:2]
+                rrt_success = False
+                for k, q_goal in enumerate(goals):
+                    if k > 0:
+                        print(f"Trying alternative goal configuration {k}/{len(goals)-1}...")
+                    q_path, rrt_success = find_collision_free_path_rrt(
+                        robot, q_start, q_goal,
+                        faces, vertices, face_normals,
+                        env=env, collisions_list=collisions_list,
+                        max_iterations=rrt_max_iterations,
+                        max_time=rrt_max_time / len(goals),
+                        other_robots=other_robots
+                    )
+                    if rrt_success:
+                        q_target = q_goal
+                        break
                 
                 if rrt_success:
-                    print(f"RRT found collision-free path with {len(q_path)} waypoints")
-                    q_matrix = np.array(q_path)
+                    # Smooth, small steps between the waypoints (no jumping)
+                    q_matrix = np.array(interpolate_waypoints(q_path, max_step_radians=np.deg2rad(2)))
+                    print(f"RRT found collision-free path: {len(q_path)} waypoints, "
+                          f"{len(q_matrix)} animation frames")
                     trajectory_success = True
                 else:
                     print("RRT could not find collision-free path")
