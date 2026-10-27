@@ -187,6 +187,9 @@ class TaskSimulation():
         self.DOBOT.setbase(SE3(-0.1, -1.5, 0.92))
         self.DOBOT.add_to_env(self.env)
 
+        # Every robot is checked against the others (each move skips itself)
+        robots = [self.Motoman, self.OMRON, self.DOBOT]
+
         #Teach code, set to also update in swift.env. TODO Figure out why it creates a 2nd figure in the while loop. 
         fig = self.OMRON.teach(self.OMRON.q, block=False)  # Matplotlib teach pendant
 
@@ -214,6 +217,7 @@ class TaskSimulation():
             faces = faces, 
             vertices = vertices,
             face_normals = face_normals,
+            other_robots=robots,
             show_path_dots=False
         )
 
@@ -231,6 +235,7 @@ class TaskSimulation():
                 faces = faces, 
                 vertices = vertices,
                 face_normals = face_normals,
+                other_robots=robots,
                 show_path_dots=False
             )
             if not self.check_pause():
@@ -243,6 +248,7 @@ class TaskSimulation():
                 faces = faces, 
                 vertices = vertices,
                 face_normals = face_normals,
+                other_robots=robots,
                 show_path_dots=False
             )
             if not self.check_pause():
@@ -259,6 +265,7 @@ class TaskSimulation():
             faces = faces, 
             vertices = vertices,
             face_normals = face_normals,
+            other_robots=robots,
             show_path_dots=False
         )
         if not self.check_pause():
@@ -272,6 +279,7 @@ class TaskSimulation():
             faces=faces, 
             vertices=vertices,
             face_normals=face_normals,
+            other_robots=robots,
             collisions_list=collisions_list,
             show_path_dots=False
         )
@@ -286,6 +294,7 @@ class TaskSimulation():
             faces=faces, 
             vertices=vertices,
             face_normals=face_normals,
+            other_robots=robots,
             collisions_list=collisions_list,
             show_path_dots=False
         )
@@ -301,6 +310,7 @@ class TaskSimulation():
             faces=faces, 
             vertices=vertices,
             face_normals=face_normals,
+            other_robots=robots,
             collisions_list=collisions_list,
             show_path_dots=False
         )
@@ -315,6 +325,7 @@ class TaskSimulation():
             faces=faces, 
             vertices=vertices,
             face_normals=face_normals,
+            other_robots=robots,
             collisions_list=collisions_list,
             show_path_dots=False
         )
@@ -329,6 +340,7 @@ class TaskSimulation():
             faces=faces, 
             vertices=vertices,
             face_normals=face_normals,
+            other_robots=robots,
             collisions_list=collisions_list,
             show_path_dots=False
         )

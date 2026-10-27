@@ -2,8 +2,6 @@ import numpy as np
 from spatialgeometry import Sphere
 from spatialmath.base import transl
 import time
-from itertools import combinations
-from ir_support import line_plane_intersection
 from roboticstoolbox import jtraj
 
 # ---------------------------------------------------------------------------
@@ -13,6 +11,8 @@ from roboticstoolbox import jtraj
 #   - Each obstacle = oriented box, rebuilt from the 8 vertices that
 #     RectangularPrism produces for it (so the faces/vertices/normals interface
 #     used everywhere else stays the same).
+#   - A tool (e.g. the knife) can be added as extra capsules in the flange frame.
+#   - Robots are checked against each other as capsule-vs-capsule distances.
 #   - Segment vs box is tested in the box's own frame with slab clipping, which
 #     catches a link crossing a face AND a link sitting completely inside a box.
 # ---------------------------------------------------------------------------
@@ -85,6 +85,71 @@ def get_link_segments(robot, q, ignore_links=DEFAULT_IGNORE_LINKS):
     return segments
 
 
+def get_collision_capsules(robot, q, margin=DEFAULT_LINK_MARGIN,
+                           ignore_links=DEFAULT_IGNORE_LINKS):
+    """Everything on the robot that can collide, as capsules (line + radius).
+
+    Returns a list of (label, p0, p1, radius). Labels are link indices (int)
+    or 'tool'. Tool capsules come from the optional robot attributes:
+        robot.collision_tool_segments : list of (p0, p1) in the FLANGE frame
+                                        (last DH frame, before robot.tool)
+        robot.collision_tool_radius   : radius in metres for those segments
+    """
+    poses = get_link_poses(robot, q)
+    capsules = [(i, p0, p1, margin) for i, p0, p1 in _segments_from_poses(poses, ignore_links)]
+
+    tool_segments = getattr(robot, 'collision_tool_segments', None)
+    if tool_segments:
+        T_flange = poses[-1]
+        r_tool = getattr(robot, 'collision_tool_radius', margin)
+        for a, b in tool_segments:
+            p0 = (T_flange @ np.r_[a, 1.0])[:3]
+            p1 = (T_flange @ np.r_[b, 1.0])[:3]
+            capsules.append(('tool', p0, p1, r_tool))
+    return capsules
+
+
+def _segments_from_poses(poses, ignore_links):
+    out = []
+    for i in range(len(poses) - 1):
+        if i in ignore_links:
+            continue
+        p0, p1 = poses[i][:3, 3], poses[i + 1][:3, 3]
+        if np.linalg.norm(p1 - p0) >= 1e-6:
+            out.append((i, p0, p1))
+    return out
+
+
+def segment_segment_distance(p1, q1, p2, q2):
+    """Closest distance between segments p1-q1 and p2-q2.
+
+    Returns (distance, closest_point_on_1, closest_point_on_2).
+    (Ericson, Real-Time Collision Detection, 5.1.9)
+    """
+    d1, d2, r = q1 - p1, q2 - p2, p1 - p2
+    a, e, f = np.dot(d1, d1), np.dot(d2, d2), np.dot(d2, r)
+    eps = 1e-12
+    if a <= eps and e <= eps:
+        s = t = 0.0
+    elif a <= eps:
+        s, t = 0.0, np.clip(f / e, 0.0, 1.0)
+    else:
+        c = np.dot(d1, r)
+        if e <= eps:
+            t, s = 0.0, np.clip(-c / a, 0.0, 1.0)
+        else:
+            b = np.dot(d1, d2)
+            denom = a * e - b * b
+            s = np.clip((b * f - c * e) / denom, 0.0, 1.0) if denom > eps else 0.0
+            t = (b * s + f) / e
+            if t < 0.0:
+                t, s = 0.0, np.clip(-c / a, 0.0, 1.0)
+            elif t > 1.0:
+                t, s = 1.0, np.clip((b - c) / a, 0.0, 1.0)
+    c1, c2 = p1 + d1 * s, p2 + d2 * t
+    return np.linalg.norm(c1 - c2), c1, c2
+
+
 def _mark_collision(point, env, collisions_list):
     """Drop a red sphere in Swift at a collision point."""
     if env is not None and collisions_list is not None:
@@ -94,34 +159,66 @@ def _mark_collision(point, env, collisions_list):
         collisions_list.append(new_collision)
 
 
+def _collision_pairs(robot, q, vertices, other_robots, margin, ignore_links,
+                     obstacle_names=None, stop_at_first=True):
+    """Core check. Yields (my_label, what_was_hit, contact_point)."""
+    hits = []
+    my_capsules = get_collision_capsules(robot, q, margin, ignore_links)
+
+    # 1. Robot (links + tool) vs static obstacle boxes
+    if vertices is not None and len(vertices) > 0:
+        boxes = boxes_from_vertices(vertices)
+        names = obstacle_names or [f"obstacle_{k}" for k in range(len(boxes))]
+        for label, p0, p1, rad in my_capsules:
+            for name, box in zip(names, boxes):
+                hit, point = segment_box_intersection(p0, p1, box, rad)
+                if hit:
+                    hits.append((label, name, point))
+                    if stop_at_first:
+                        return hits
+
+    # 2. Robot vs other robots, at the other robots' CURRENT joint angles.
+    #    Base columns are included here: another arm can hit them.
+    for other in (other_robots or []):
+        if other is robot:
+            continue
+        mine_all = get_collision_capsules(robot, q, margin, ignore_links=())
+        theirs = get_collision_capsules(other, other.q, margin, ignore_links=())
+        for label, a0, a1, ra in mine_all:
+            for olabel, b0, b1, rb in theirs:
+                dist, c1, c2 = segment_segment_distance(a0, a1, b0, b1)
+                if dist < ra + rb:
+                    hits.append((label, f"{other.name}:{olabel}", (c1 + c2) / 2))
+                    if stop_at_first:
+                        return hits
+    return hits
+
+
 def check_single_config_collision(robot, q, faces, vertices, face_normals,
                                   env=None, collisions_list=None,
                                   return_once_found=True,
                                   margin=DEFAULT_LINK_MARGIN,
-                                  ignore_links=DEFAULT_IGNORE_LINKS):
+                                  ignore_links=DEFAULT_IGNORE_LINKS,
+                                  other_robots=None):
     """Check one joint configuration. Returns (collision_detected, collision_points).
 
+    Checks the robot's links (and tool, if it has one) against the obstacle
+    boxes, and against `other_robots` at their current poses.
     `faces` and `face_normals` are accepted for backwards compatibility; the
     box test only needs the vertices.
     """
-    boxes = boxes_from_vertices(vertices)
-    collision_points = []
-
-    for _, p0, p1 in get_link_segments(robot, q, ignore_links):
-        for box in boxes:
-            hit, point = segment_box_intersection(p0, p1, box, margin)
-            if hit:
-                collision_points.append(point)
-                _mark_collision(point, env, collisions_list)
-                if return_once_found:
-                    return True, collision_points
-
-    return len(collision_points) > 0, collision_points
+    hits = _collision_pairs(robot, q, vertices, other_robots, margin, ignore_links,
+                            stop_at_first=return_once_found)
+    points = [p for _, _, p in hits]
+    for p in points:
+        _mark_collision(p, env, collisions_list)
+    return len(points) > 0, points
 
 
 def is_collision(robot, q_list, faces, vertices, face_normals,
                  collisions_list=None, env=None, return_once_found=True,
-                 margin=DEFAULT_LINK_MARGIN, ignore_links=DEFAULT_IGNORE_LINKS):
+                 margin=DEFAULT_LINK_MARGIN, ignore_links=DEFAULT_IGNORE_LINKS,
+                 other_robots=None):
     """Check a list of configurations (a trajectory). True if any collides."""
     found = False
     for q in q_list:
@@ -129,7 +226,8 @@ def is_collision(robot, q_list, faces, vertices, face_normals,
             robot, q, faces, vertices, face_normals,
             env=env, collisions_list=collisions_list,
             return_once_found=return_once_found,
-            margin=margin, ignore_links=ignore_links
+            margin=margin, ignore_links=ignore_links,
+            other_robots=other_robots
         )
         if hit:
             found = True
@@ -139,16 +237,12 @@ def is_collision(robot, q_list, faces, vertices, face_normals,
 
 
 def collision_report(robot, q, vertices, obstacle_names=None,
-                     margin=DEFAULT_LINK_MARGIN, ignore_links=DEFAULT_IGNORE_LINKS):
-    """Debug helper: list of (link_index, obstacle_name) pairs that collide."""
-    boxes = boxes_from_vertices(vertices)
-    names = obstacle_names or [f"obstacle_{k}" for k in range(len(boxes))]
-    hits = []
-    for i, p0, p1 in get_link_segments(robot, q, ignore_links):
-        for name, box in zip(names, boxes):
-            if segment_box_intersection(p0, p1, box, margin)[0]:
-                hits.append((i, name))
-    return hits
+                     margin=DEFAULT_LINK_MARGIN, ignore_links=DEFAULT_IGNORE_LINKS,
+                     other_robots=None):
+    """Debug helper: list of (link_index or 'tool', what_it_hit) pairs."""
+    hits = _collision_pairs(robot, q, vertices, other_robots, margin, ignore_links,
+                            obstacle_names=obstacle_names, stop_at_first=False)
+    return [(label, what) for label, what, _ in hits]
 
 #Barycentric check intersections
 def is_intersection_point_inside_triangle(intersect_p, triangle_verts):
@@ -188,17 +282,19 @@ def find_collision_free_path_rrt(robot, q_start, q_goal, faces, vertices, face_n
                                  env=None, collisions_list=None,
                                  max_iterations=1000, step_size=0.2, 
                                  goal_sample_rate=0.1, goal_threshold=0.3,
-                                 visualize=False):
+                                 visualize=False, other_robots=None):
     
     print(f"Starting RRT search (max iterations: {max_iterations})...")
     
     # Check if start and goal are collision-free
     start_collision, _ = check_single_config_collision(
-        robot, q_start, faces, vertices, face_normals, return_once_found=True
+        robot, q_start, faces, vertices, face_normals, return_once_found=True,
+        other_robots=other_robots
     )
     
     goal_collision, _ = check_single_config_collision(
-        robot, q_goal, faces, vertices, face_normals, return_once_found=True
+        robot, q_goal, faces, vertices, face_normals, return_once_found=True,
+        other_robots=other_robots
     )
     
     if start_collision:
@@ -253,7 +349,8 @@ def find_collision_free_path_rrt(robot, q_start, q_goal, faces, vertices, face_n
         
         # Check if extension is collision-free
         collision = check_line_collision(
-            robot, q_near, q_new, faces, vertices, face_normals, steps=5
+            robot, q_near, q_new, faces, vertices, face_normals, steps=5,
+            other_robots=other_robots
         )
         
         if not collision:
@@ -274,7 +371,8 @@ def find_collision_free_path_rrt(robot, q_start, q_goal, faces, vertices, face_n
             if dist_to_goal < goal_threshold:
                 # Try direct connection to goal
                 collision = check_line_collision(
-                    robot, q_new, q_goal, faces, vertices, face_normals, steps=10
+                    robot, q_new, q_goal, faces, vertices, face_normals, steps=10,
+                    other_robots=other_robots
                 )
                 
                 if not collision:
@@ -290,7 +388,8 @@ def find_collision_free_path_rrt(robot, q_start, q_goal, faces, vertices, face_n
                     print(f"  Path length: {len(path)} waypoints")
                     
                     # Smooth path
-                    path = smooth_path(robot, path, faces, vertices, face_normals)
+                    path = smooth_path(robot, path, faces, vertices, face_normals,
+                                       other_robots=other_robots)
                     print(f"  Smoothed to: {len(path)} waypoints")
                     
                     return path, True
@@ -305,13 +404,15 @@ def find_collision_free_path_rrt(robot, q_start, q_goal, faces, vertices, face_n
     
     return [], False
 
-def check_line_collision(robot, q1, q2, faces, vertices, face_normals, steps=10):
+def check_line_collision(robot, q1, q2, faces, vertices, face_normals, steps=10,
+                         other_robots=None):
     for i in range(steps + 1):
         alpha = i / steps
         q_interp = (1 - alpha) * np.array(q1) + alpha * np.array(q2)
         
         collision, _ = check_single_config_collision(
-            robot, q_interp, faces, vertices, face_normals, return_once_found=True
+            robot, q_interp, faces, vertices, face_normals, return_once_found=True,
+            other_robots=other_robots
         )
         
         if collision:
@@ -331,7 +432,8 @@ def extract_path(tree):
     return path
 
 #Removes unnecessary waypoints
-def smooth_path(robot, path, faces, vertices, face_normals, max_attempts=100):
+def smooth_path(robot, path, faces, vertices, face_normals, max_attempts=100,
+                other_robots=None):
     if len(path) <= 2:
         return path
     
@@ -348,7 +450,8 @@ def smooth_path(robot, path, faces, vertices, face_normals, max_attempts=100):
         # Try direct connection
         collision = check_line_collision(
             robot, smoothed[i], smoothed[j], 
-            faces, vertices, face_normals, steps=20
+            faces, vertices, face_normals, steps=20,
+            other_robots=other_robots
         )
         
         if not collision:

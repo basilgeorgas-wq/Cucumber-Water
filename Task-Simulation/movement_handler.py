@@ -20,7 +20,8 @@ def ikine_move(robot, target_pose, env=None, q0=None,
                # Collision parameters
                check_collision=True, faces=None, vertices=None, 
                face_normals=None, collisions_list=None,
-               collision_free_search=True, stop_on_collision=True):
+               collision_free_search=True, stop_on_collision=True,
+               other_robots=None):
    
     # Validate collision parameters
     check_collision = validate_collision_params(
@@ -39,7 +40,8 @@ def ikine_move(robot, target_pose, env=None, q0=None,
     if check_collision:
         def collision_check_fn(q):
             result, _ = check_single_config_collision(
-                robot, q, faces, vertices, face_normals, return_once_found=True
+                robot, q, faces, vertices, face_normals, return_once_found=True,
+                other_robots=other_robots
             )
             return result
     
@@ -90,7 +92,8 @@ def ikine_move(robot, target_pose, env=None, q0=None,
         print("\nChecking trajectory for collisions...")
         traj_collision = is_collision(
             robot, list(q_matrix), faces, vertices, face_normals,
-            collisions_list=collisions_list, env=env, return_once_found=True
+            collisions_list=collisions_list, env=env, return_once_found=True,
+            other_robots=other_robots
         )
         
         if traj_collision:
@@ -105,7 +108,8 @@ def ikine_move(robot, target_pose, env=None, q0=None,
                     faces, vertices, face_normals,
                     env=env, collisions_list=collisions_list,
                     max_iterations=1000,
-                    visualize=False
+                    visualize=False,
+                    other_robots=other_robots
                 )
                 
                 if rrt_success:
@@ -152,8 +156,9 @@ def linear_move(robot, target_pose, env=None, q0=None, steps=50,
                 position_tolerance=0.005, check_reachability=True, 
                 smooth_failures=True,
                 # Collision parameters
-                check_collision=False, faces=None, vertices=None, 
-                face_normals=None, stop_on_collision=True):
+                check_collision=True, faces=None, vertices=None, 
+                face_normals=None, stop_on_collision=True,
+                other_robots=None):
     #Increase waypoints to create smoother path
 
     # Validate collision parameters
@@ -175,10 +180,10 @@ def linear_move(robot, target_pose, env=None, q0=None, steps=50,
     # Create collision checking function if enabled
     collision_check_fn = None
     if check_collision:
-        from collision_handler import check_single_config_collision
         def collision_check_fn(q):
             result, _ = check_single_config_collision(
-                robot, q, faces, vertices, face_normals, return_once_found=True
+                robot, q, faces, vertices, face_normals, return_once_found=True,
+                other_robots=other_robots
             )
             return result
     
