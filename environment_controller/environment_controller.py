@@ -113,8 +113,12 @@ class Environment_Manager():
         vertices = np.array(vertices)
         vertices_homogeneous = np.hstack([vertices, np.ones((len(vertices), 1))])
         vertices_transformed = (pose.A @ vertices_homogeneous.T).T[:, :3]
-        
-        return obstacle, vertices_transformed, faces, np.array(face_normals)
+
+        # Normals are directions, so they must be rotated with the box too
+        # (previously left in the box's local frame, which broke rotated boxes like the fridge door)
+        face_normals_rotated = (pose.R @ np.array(face_normals, dtype=float).T).T
+
+        return obstacle, vertices_transformed, faces, face_normals_rotated
     
     def get_collision_data(self):
         """
