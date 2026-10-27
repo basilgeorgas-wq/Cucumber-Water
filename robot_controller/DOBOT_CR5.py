@@ -6,6 +6,7 @@ import roboticstoolbox as rtb
 import spatialmath.base as spb
 from spatialmath import SE3
 from ir_support.robots.DHRobot3D import DHRobot3D
+from attachments import AttachmentMixin
 import time
 import os
 from roboticstoolbox import DHLink, DHRobot, jtraj
@@ -15,7 +16,7 @@ from roboticstoolbox import DHLink, DHRobot, jtraj
 from math import pi
 
 # -----------------------------------------------------------------------------------#
-class DOBOT_CR5(DHRobot3D):
+class DOBOT_CR5(AttachmentMixin, DHRobot3D):
     """ 
     Example usage:
     >>> from ir-support import OMRON_TM5

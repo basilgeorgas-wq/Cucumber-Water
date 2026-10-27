@@ -5,6 +5,7 @@ import roboticstoolbox as rtb
 import spatialmath.base as spb
 from spatialmath import SE3
 from ir_support.robots.DHRobot3D import DHRobot3D
+from attachments import AttachmentMixin
 import time
 import os
 
@@ -13,7 +14,7 @@ import os
 from math import pi
 
 # -----------------------------------------------------------------------------------#
-class MOTOMAN_GP4(DHRobot3D): 
+class MOTOMAN_GP4(AttachmentMixin, DHRobot3D): 
     def __init__(self):
         self.has_knife = False
         self.knife_mesh = None
