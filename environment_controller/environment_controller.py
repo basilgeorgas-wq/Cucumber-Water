@@ -135,6 +135,22 @@ class Environment_Manager():
         self.env.add(glass)
         return glass
 
+    def add_glass_obstacle(self, name, base_position, clearance=0.003):
+        """Hitbox for a glass standing on the counter (base_position = its base centre),
+        so the robots steer around it. Not drawn: the glass itself is visible."""
+        x, y, z = base_position
+        d = 2 * self.GLASS_RADIUS + 2 * clearance
+        h = self.GLASS_HEIGHT + clearance
+        pose = SE3(float(x), float(y), float(z + h / 2))
+        v, f, n = RectangularPrism(d, d, h, center=[0, 0, 0]).get_data()
+        v = (pose.A @ np.c_[np.array(v), np.ones(len(v))].T).T[:, :3]
+        self.remove_obstacle(name)
+        self.obstacles.append({'name': name, 'vertices': v, 'faces': f,
+                               'face_normals': np.array(n, dtype=float)})
+
+    def remove_obstacle(self, name):
+        self.obstacles = [o for o in self.obstacles if o['name'] != name]
+
     def add_water(self, pose=None):
         """Water inside the glass: translucent blue cylinder centred on its own origin."""
         water = geometry.Cylinder(radius=self.GLASS_RADIUS * 0.85, length=self.GLASS_HEIGHT * 0.6,
