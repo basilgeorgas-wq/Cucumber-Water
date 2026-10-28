@@ -22,6 +22,7 @@ from OMRON_TM5 import OMRON_TM5_700
 from DOBOT_CR5 import DOBOT_CR5
 from MOTOMAN_GP4 import MOTOMAN_GP4
 
+import movement_handler
 from environment_controller import Environment_Manager
 from gripper import Gripper
 from movement_handler import (ikine_move, rmrc_move, linear_move, start_joystick_control,
@@ -30,9 +31,12 @@ from movement_handler import (ikine_move, rmrc_move, linear_move, start_joystick
                               wrap_to_reference, get_joint_limits)
 
 class TaskSimulation():
-    def __init__(self, use_teach_pendant=False):
+    def __init__(self, use_teach_pendant=False, speed=1.0):
         # True: open the Omron teach pendant first; press Enter to start the task
         self.use_teach_pendant = use_teach_pendant
+        # Animation playback speed (1 = real time). Planning time is unaffected.
+        self.speed = speed
+        movement_handler.PLAYBACK_SPEED = speed
         self.env = None
         self.OMRON = None
         self.DOBOT = None
@@ -216,6 +220,7 @@ class TaskSimulation():
         self._move_kwargs = dict(env=self.env, faces=faces, vertices=vertices,
                                  face_normals=face_normals, other_robots=robots,
                                  collisions_list=collisions_list, show_path_dots=False)
+        self._refresh_obstacles()          # includes the glasses on the counter
         self.step_log = []
         self.run_task()
 
@@ -237,13 +242,27 @@ class TaskSimulation():
     GRIPPER_LENGTH_DOBOT = DOBOT_FLANGE_FACE + 0.189   # -> AG-95 grip point (finger pad centre)
     FLANGE_TO_GLASS = 0.0          # extra offset from the grip point to the glass centre
 
-    SLICE_POSITION = (-0.8, 0.05, 0.94)   # where the cut slice is placed after slicing
-    GLASS_COUNTER_POSITION = (-0.38, -1.9, 0.913) # glass base on the counter at the start
-    GLASS_PLACE_POSITION = (-0.38, -0.95, 0.913)  # ... and where it is served at the end
-                                                  #   (a straight move from the handover)
-    GLASS_COUNTER_GRIP_YAW = pi / 2               # Dobot grips it facing -x (from the robot's side)
+    # One slice is cut for each glass; they appear in a row next to the cucumber
+    # (8 cm apart: the Robotiq is 7.6 cm thick across its fingers)
+    SLICE_POSITIONS = [(-0.82 + 0.08 * i, 0.11, 0.94) for i in range(5)]
+
+    # Glass bases on the counter. The AG-95's open fingers are 16 cm wide, so
+    # empty glasses that it grips from the robot's side (facing -x) need 14 cm
+    # between them in a row. Five of those don't fit within reach, so they
+    # start in two staggered rows; the front row is picked first, then the
+    # back row (whose neighbours are behind the hand's path, not in it).
+    GLASS_START_POSITIONS = [(-0.38, -1.85, 0.913), (-0.38, -2.05, 0.913), (-0.38, -2.25, 0.913),
+                             (-0.54, -1.95, 0.913), (-0.54, -2.15, 0.913)]
+    GLASS_START_GRIP_YAW = pi / 2                 # gripped facing -x (from the robot's side)
+    # Filled glasses are served in one straight line, 10 cm apart. They're put
+    # down gripped facing +y (fingers open across the line), starting at the
+    # end nearest the handover, so the hand always comes from the empty side.
+    GLASS_SERVE_POSITIONS = [(-0.38, -0.70 - 0.10 * i, 0.913) for i in range(5)]
+    GLASS_SERVE_GRIP_YAW = 0.0
+    GLASS_RAISE = 0.12                            # picked glass is lifted this high before moving off
     GLASS_APPROACH = 0.10                         # Dobot's fingers slide in level from this far
-    GLASS_PLACE_APPROACH = 0.06                   # glass is lowered onto the counter from this high
+    GLASS_PLACE_APPROACH = 0.12                   # glass is lowered onto the counter from this high
+                                                  # (its base clears the served glasses' rims)
     SINK_GLASS_POSITION = (-0.685, -1.345, 1.04)  # glass centre under the tap spout
     SINK_SLIDE = 0.12              # the glass slides in/out horizontally this far under the spout
     HANDOVER_GLASS_POSITION = (0.0, -0.5, 1.05) # glass centre when held out for the Omron
@@ -280,6 +299,10 @@ class TaskSimulation():
         return SE3.Rz(yaw) * SE3.Rx(-pi / 2)
 
     # ======================================================================
+    def _pause(self, seconds):
+        """Hold still for a moment (e.g. while a gripper closes), scaled by the playback speed."""
+        self.env.step(seconds / movement_handler.PLAYBACK_SPEED)
+
     def _move(self, label, robot, target, linear=False, **kwargs):
         """Run one move with the shared settings. Returns True if the robot got there."""
         if not self.check_pause():
@@ -291,8 +314,13 @@ class TaskSimulation():
             q_matrix, ok, _ = linear_move(robot=robot, target_pose=target, **args)
             success = q_matrix is not None and ok
         else:
-            q_matrix, _, ok = ikine_move(robot=robot, target_pose=target, q0=robot.q, **args)
-            success = q_matrix is not None and ok
+            for attempt in range(2):          # path planning is random: one more try if it fails
+                if attempt:
+                    print(f"{label}: no path found - trying again")
+                q_matrix, _, ok = ikine_move(robot=robot, target_pose=target, q0=robot.q, **args)
+                success = q_matrix is not None and ok
+                if success:
+                    break
         self.step_log.append((label, success))
         return success
 
@@ -367,7 +395,7 @@ class TaskSimulation():
                                      mount_offset=self.DOBOT_FLANGE_FACE)
 
     def _setup_dobot_with_glass(self, faces, vertices, face_normals, robots):
-        """Put the glass on the kitchen counter, ready for the Dobot to pick up."""
+        """Put the empty glasses on the kitchen counter, ready for the Dobot to pick up."""
         env_mgr = self.environment
         H, R = env_mgr.GLASS_HEIGHT, env_mgr.GLASS_RADIUS
 
@@ -380,31 +408,52 @@ class TaskSimulation():
         # so a glass standing on the counter doesn't count as hitting it
         self.glass_axis = [tuple((self.T_flange_glass @ np.array([0, 0, z, 1.0]))[:3])
                            for z in (R, H - R)]
-        self.glass = env_mgr.add_glass(SE3(*self.GLASS_COUNTER_POSITION))
+        # Every glass standing on the counter is an obstacle for all the robots
+        self.glasses = []
+        self._obstacle_arrays = []        # keeps old obstacle arrays alive (the collision
+                                          # checker caches boxes by array identity)
+        for i, base in enumerate(self.GLASS_START_POSITIONS):
+            self.glasses.append(env_mgr.add_glass(SE3(*base)))
+            env_mgr.add_glass_obstacle(f"glass_{i + 1}", base)
+        self.glass = self.glasses[0]      # the glass being worked on
+        self._refresh_obstacles()
         if getattr(self, 'dobot_gripper', None) is not None:
             self.dobot_gripper.open()
+
+    def _refresh_obstacles(self):
+        """Rebuild the obstacle arrays after a glass is picked up or put down."""
+        faces, vertices, face_normals = self.environment.get_collision_data()
+        self._obstacle_arrays.append(vertices)
+        if getattr(self, '_move_kwargs', None) is not None:
+            self._move_kwargs.update(faces=faces, vertices=vertices, face_normals=face_normals)
+        return faces, vertices, face_normals
 
     def _glass_centre_on_counter(self, base_position, lift=0.0):
         x, y, z = base_position
         return (x, y, z + self.environment.GLASS_HEIGHT / 2 + lift)
 
-    def pick_glass(self):
-        """Dobot picks the glass up off the counter (side grip, coming in level)."""
-        D, glass = self.DOBOT, self.glass
+    def pick_glass(self, i):
+        """Dobot picks glass i up off the counter (side grip, coming in level)."""
+        D, glass = self.DOBOT, self.glasses[i]
+        self.glass = glass
         R = self.environment.GLASS_RADIUS
-        yaw = self.GLASS_COUNTER_GRIP_YAW
-        T_grasp = self._dobot_flange_for_glass(self._glass_centre_on_counter(self.GLASS_COUNTER_POSITION), yaw)
+        yaw = self.GLASS_START_GRIP_YAW
+        base = self.GLASS_START_POSITIONS[i]
+        T_grasp = self._dobot_flange_for_glass(self._glass_centre_on_counter(base), yaw)
         T_pre = SE3(-self.GLASS_APPROACH * T_grasp.R[:, 2]) * T_grasp     # back along the tool axis
 
-        print("Dobot picking up the glass from the counter")
+        print(f"Dobot picking up glass {i + 1} from the counter")
         self.dobot_gripper.open()
+        # This glass is no longer an obstacle: the fingers go round it
+        self.environment.remove_obstacle(f"glass_{i + 1}")
+        self._refresh_obstacles()
         ok = (self._move_above("Dobot to glass", D, T_pre, T_grasp)
               and self._move("Dobot reach glass", D, T_grasp, linear=True, steps=10,
                              position_tolerance=0.005))
         if not ok:
             return False
         self.dobot_gripper.grip()
-        self.env.step(0.3)
+        self._pause(0.3)
         D.attach(glass, self.T_flange_glass)                 # carried, glass collision after lift
         if not self._move("Dobot lift glass", D, SE3(0, 0, 0.03) * T_grasp, linear=True, steps=5,
                           position_tolerance=0.005):
@@ -416,17 +465,21 @@ class TaskSimulation():
         self.glass_tilt_limit = self.GLASS_TILT_LIMIT_EMPTY
         D.path_constraint = self._make_upright_rule()
         D.project_to_constraint = self._project_upright
-        return True
+        # Straight up until its base is above the other glasses' rims, so it
+        # isn't threaded between them on the way to the sink
+        return self._move_glass("Dobot raise glass",
+                                SE3(0, 0, self.GLASS_RAISE) * T_grasp, steps=8)
 
-    def place_glass(self, extras=()):
-        """Dobot sets the glass (and whatever is in it) down on the counter and lets go."""
+    def place_glass(self, i, spot, extras=()):
+        """Dobot sets glass i (and whatever is in it) down at serving spot `spot` and lets go."""
         D, glass = self.DOBOT, self.glass
-        yaw = self.GLASS_COUNTER_GRIP_YAW
+        yaw = self.GLASS_SERVE_GRIP_YAW
+        base = self.GLASS_SERVE_POSITIONS[spot]
         T_place = self._dobot_flange_for_glass(
-            self._glass_centre_on_counter(self.GLASS_PLACE_POSITION, lift=0.005), yaw)
+            self._glass_centre_on_counter(base, lift=0.005), yaw)
         T_above = SE3(0, 0, self.GLASS_PLACE_APPROACH) * T_place
 
-        print("Dobot putting the glass down on the counter")
+        print(f"Dobot putting glass {i + 1} down on the counter")
         ok = (self._move_glass("Dobot glass above counter", T_above)
               and self._move_glass("Dobot lower glass onto counter", T_place, steps=8))
         if not ok:
@@ -436,13 +489,16 @@ class TaskSimulation():
         for shape in (glass,) + tuple(extras):
             if shape is not None:
                 D.detach(shape)
-        glass.T = SE3(*self.GLASS_PLACE_POSITION).A
+        glass.T = SE3(*base).A
         D.path_constraint = None
         D.project_to_constraint = None
-        self.env.step(0.3)
+        self._pause(0.3)
         T_back = SE3(-self.GLASS_APPROACH * T_place.R[:, 2]) * T_place
-        self._move("Dobot move away from glass", D, T_back, linear=True, steps=8,
+        self._move(f"Dobot move away from glass {i + 1}", D, T_back, linear=True, steps=8,
                    position_tolerance=0.005)
+        # Now that the fingers are out, the served glass is an obstacle too
+        self.environment.add_glass_obstacle(f"served_glass_{i + 1}", base)
+        self._refresh_obstacles()
         return True
 
     def _sink_front_position(self):
@@ -463,9 +519,12 @@ class TaskSimulation():
             buf_ok = True
         else:
             print(f"{label}: straight line blocked - planning a path around")
-            q_matrix, _, ok = ikine_move(robot=self.DOBOT, target_pose=target, q0=self.DOBOT.q,
-                                         **self._move_kwargs)
-            buf_ok = q_matrix is not None and ok
+            for attempt in range(2):          # path planning is random: one more try if it fails
+                q_matrix, _, ok = ikine_move(robot=self.DOBOT, target_pose=target, q0=self.DOBOT.q,
+                                             **self._move_kwargs)
+                buf_ok = q_matrix is not None and ok
+                if buf_ok:
+                    break
         self.step_log.append((label, buf_ok))
         return buf_ok
 
@@ -531,7 +590,7 @@ class TaskSimulation():
         if not ok:
             return False
         gripper.grip("grip_cucumber")
-        self.env.step(0.3)
+        self._pause(0.3)
         O.attach(cucumber)                                         # carried, no collision yet
 
         # Lift 1.5 cm off the shelf (the cucumber is touching the shelf, so its
@@ -562,11 +621,98 @@ class TaskSimulation():
         gripper.open()
         O.detach(cucumber)
         cucumber.T = T_cuc_bench.A                                  # settles onto the bench
-        self.env.step(0.3)
+        self._pause(0.3)
         self._move("Omron move away from cucumber", O, T_above, linear=True, steps=8,
                    position_tolerance=0.005)
         self._park(O, "Omron back to start (out of the Motoman's way)")
         return True
+
+    def serve_glass(self, i, cuc_slice, spot):
+        """One full round for glass i: the Dobot picks it up, fills it at the sink and
+        holds it out, the Omron drops slice i in, and the Dobot puts it at serving
+        spot `spot` (the next free place in the line). Returns True if it got there."""
+        env_mgr = self.environment
+        H = env_mgr.GLASS_HEIGHT
+        water = None
+
+        # ---- 2. Dobot fills the glass at the sink ---------------------------
+        print("Dobot filling the glass at the sink")
+        T_front = self._dobot_flange_for_glass(self._sink_front_position(), pi/2)
+        have_glass = self.pick_glass(i)
+        filled = (have_glass
+                  and self._move_glass("Dobot to front of tap", T_front)
+                  and self._move_glass("Dobot slide glass under tap",
+                                       self._dobot_flange_for_glass(self.SINK_GLASS_POSITION, pi/2),
+                                       steps=15))
+        if filled:
+            self.glass_tilt_limit = self.GLASS_TILT_LIMIT      # full glass: keep it level
+            water = env_mgr.add_water()
+            # water cylinder is centred on its origin: put it in the lower part of the glass
+            self.DOBOT.attach(water, self.T_flange_glass @ SE3(0, 0, 0.6 * H / 2 + 0.005).A)
+            for _ in range(10):
+                self._pause(0.05)
+
+        # ---- 3. Dobot holds the glass out for the Omron -------------------
+        if filled:
+            self._move_glass("Dobot slide glass out from tap", T_front, steps=15)
+        print("Dobot holding out the glass")
+        held = have_glass and self._move_glass("Dobot hold out glass",
+                                self._dobot_flange_for_glass(self.HANDOVER_GLASS_POSITION, 0.0))
+
+        # ---- 4. Omron picks up the slice ----------------------------------
+        print(f"Omron picking up slice {i + 1}")
+        sx, sy, sz = self.SLICE_POSITIONS[i]
+        pick_z = sz + self.PICK_GAP + self.GRIPPER_LENGTH_OMRON   # flange height: grip at slice centre
+        above_ok = self._move_above("Omron above slice", self.OMRON,
+                                    SE3(sx, sy, pick_z + self.APPROACH_HEIGHT) * self.TOOL_DOWN,
+                                    SE3(sx, sy, pick_z) * self.TOOL_DOWN)
+        picked = above_ok and self._move("Omron pick slice", self.OMRON,
+                                         SE3(sx, sy, pick_z) * self.TOOL_DOWN, linear=True,
+                                         steps=10, position_tolerance=0.005)
+        if picked:
+            self.omron_gripper.grip()
+            self._pause(0.3)
+            self.OMRON.attach(cuc_slice)          # slice now moves with the Omron
+            self._move("Omron lift slice", self.OMRON,
+                       SE3(sx, sy, pick_z + self.APPROACH_HEIGHT) * self.TOOL_DOWN, linear=True,
+                       steps=10, position_tolerance=0.005)
+
+        # ---- 5. Omron drops the slice into the glass ------------------------
+        in_glass = False
+        if picked and held:
+            print("Omron putting the slice in the glass")
+            gx, gy, gz = self.HANDOVER_GLASS_POSITION
+            drop_z = gz + H / 2 + self.DROP_CLEARANCE + self.GRIPPER_LENGTH_OMRON
+            over = self._move_above("Omron above glass", self.OMRON,
+                                    SE3(gx, gy, drop_z + self.DROP_APPROACH_HEIGHT) * self.TOOL_DOWN,
+                                    SE3(gx, gy, drop_z) * self.TOOL_DOWN)
+            dropped = over and self._move("Omron lower to glass", self.OMRON,
+                                          SE3(gx, gy, drop_z) * self.TOOL_DOWN, linear=True,
+                                          steps=10, position_tolerance=0.005)
+            if dropped:
+                # Release: slice drops to the bottom of the glass and moves with it
+                self.omron_gripper.open()
+                self.OMRON.detach(cuc_slice)
+                cuc_slice.T = (SE3(gx, gy, gz - H / 2 + env_mgr.SLICE_RADIUS + 0.005)).A
+                self.DOBOT.attach(cuc_slice)
+                in_glass = True
+                self._pause(0.05)
+                self._move("Omron move away", self.OMRON,
+                           SE3(gx, gy, drop_z + self.DROP_APPROACH_HEIGHT) * self.TOOL_DOWN, linear=True,
+                           steps=10, position_tolerance=0.005)
+        else:
+            print("Skipping the drop: " +
+                  ("slice was not picked up" if not picked else "glass is not held out"))
+
+        # ---- 6. Glass with the slice goes into the serving line ------------------
+        self._park(self.OMRON, "Omron back to start")
+        if not have_glass:
+            return False
+        placed = self.place_glass(i, spot, extras=(water, cuc_slice if in_glass else None))
+        # Back to the start pose between glasses: this also unwinds the wrist, which
+        # otherwise creeps a little further round every glass until it hits its limit
+        self._park(self.DOBOT, "Dobot back to start")
+        return placed
 
     def _park(self, robot, label):
         """Send a robot back to the joint angles it started the task with."""
@@ -578,11 +724,6 @@ class TaskSimulation():
         # Where each robot started: it can return here to get out of the others' way
         self._home_q = {r.name: np.array(r.q, dtype=float)
                         for r in (self.Motoman, self.OMRON, self.DOBOT)}
-        H, R = env_mgr.GLASS_HEIGHT, env_mgr.GLASS_RADIUS
-
-        water = None
-        cuc_slice = None
-
         # ---- 0. Omron takes the cucumber out of the fridge ----------------------
         if not self.fetch_cucumber():
             print("Cucumber not delivered to the bench - the Motoman will cut thin air")
@@ -608,102 +749,39 @@ class TaskSimulation():
         # Knife tilted 15 deg nose-down, hand just behind the bench edge: the blade
         # reaches the board over the cucumber while the wrist housing stays clear
         # of the bench (at the old level pose the wrist was lower than the blade).
+        # One slice per glass: each cut slice appears in the row next to the cucumber.
         print("Motoman performing slicing")
         cut_pose = SE3.RPY([0, self.CUT_PITCH, 0])
+        n_glasses = len(self.glasses)
+        slices = []
         y = 0
-        for i in range(5):
+        for i in range(n_glasses):
             self._move(f"Motoman slice {i+1} up", self.Motoman,
                        SE3(self.CUT_FLANGE_X, y, self.CUT_UP_Z) @ cut_pose, linear=True,
                        steps=10, position_tolerance=0.005, check_reachability=True)
             self._move(f"Motoman slice {i+1} down", self.Motoman,
                        SE3(self.CUT_FLANGE_X, y, self.CUT_DOWN_Z) @ cut_pose, linear=True,
                        steps=10, position_tolerance=0.005, check_reachability=True)
+            slices.append(env_mgr.add_slice(SE3(*self.SLICE_POSITIONS[i])))
             y += -0.05
-            self.env.step(0.05)
-
-        # The cut slice appears next to the cucumber (stand-in until the
-        # cucumber_cut_*.stl pieces are swapped in during slicing)
-        cuc_slice = env_mgr.add_slice(SE3(*self.SLICE_POSITION))
+            self._pause(0.05)
 
         # Retract, tilted 15 deg: the level orientation isn't reachable up there
         print("Motoman retracting")
         self._move("Motoman retract", self.Motoman,
                    SE3(-0.9, -0.2, 1.8) @ SE3.RPY([0, 75*pi/180, 0]), steps=30)
 
-        # ---- 2. Dobot fills the glass at the sink ---------------------------
-        print("Dobot filling the glass at the sink")
-        T_front = self._dobot_flange_for_glass(self._sink_front_position(), pi/2)
-        have_glass = self.pick_glass()
-        filled = (have_glass
-                  and self._move_glass("Dobot to front of tap", T_front)
-                  and self._move_glass("Dobot slide glass under tap",
-                                       self._dobot_flange_for_glass(self.SINK_GLASS_POSITION, pi/2),
-                                       steps=15))
-        if filled:
-            self.glass_tilt_limit = self.GLASS_TILT_LIMIT      # full glass: keep it level
-            water = env_mgr.add_water()
-            # water cylinder is centred on its origin: put it in the lower part of the glass
-            self.DOBOT.attach(water, self.T_flange_glass @ SE3(0, 0, 0.6 * H / 2 + 0.005).A)
-            for _ in range(10):
-                self.env.step(0.05)
-
-        # ---- 3. Dobot holds the glass out for the Omron -------------------
-        if filled:
-            self._move_glass("Dobot slide glass out from tap", T_front, steps=15)
-        print("Dobot holding out the glass")
-        held = have_glass and self._move_glass("Dobot hold out glass",
-                                self._dobot_flange_for_glass(self.HANDOVER_GLASS_POSITION, 0.0))
-
-        # ---- 4. Omron picks up the slice ----------------------------------
-        print("Omron picking up the slice")
-        sx, sy, sz = self.SLICE_POSITION
-        pick_z = sz + self.PICK_GAP + self.GRIPPER_LENGTH_OMRON   # flange height: grip at slice centre
-        above_ok = self._move_above("Omron above slice", self.OMRON,
-                                    SE3(sx, sy, pick_z + self.APPROACH_HEIGHT) * self.TOOL_DOWN,
-                                    SE3(sx, sy, pick_z) * self.TOOL_DOWN)
-        picked = above_ok and self._move("Omron pick slice", self.OMRON,
-                                         SE3(sx, sy, pick_z) * self.TOOL_DOWN, linear=True,
-                                         steps=10, position_tolerance=0.005)
-        if picked:
-            self.omron_gripper.grip()
-            self.env.step(0.3)
-            self.OMRON.attach(cuc_slice)          # slice now moves with the Omron
-            self._move("Omron lift slice", self.OMRON,
-                       SE3(sx, sy, pick_z + self.APPROACH_HEIGHT) * self.TOOL_DOWN, linear=True,
-                       steps=10, position_tolerance=0.005)
-
-        # ---- 5. Omron drops the slice into the glass ------------------------
-        if picked and held:
-            print("Omron putting the slice in the glass")
-            gx, gy, gz = self.HANDOVER_GLASS_POSITION
-            drop_z = gz + H / 2 + self.DROP_CLEARANCE + self.GRIPPER_LENGTH_OMRON
-            over = self._move_above("Omron above glass", self.OMRON,
-                                    SE3(gx, gy, drop_z + self.DROP_APPROACH_HEIGHT) * self.TOOL_DOWN,
-                                    SE3(gx, gy, drop_z) * self.TOOL_DOWN)
-            dropped = over and self._move("Omron lower to glass", self.OMRON,
-                                          SE3(gx, gy, drop_z) * self.TOOL_DOWN, linear=True,
-                                          steps=10, position_tolerance=0.005)
-            if dropped:
-                # Release: slice drops to the bottom of the glass and moves with it
-                self.omron_gripper.open()
-                self.OMRON.detach(cuc_slice)
-                cuc_slice.T = (SE3(gx, gy, gz - H / 2 + env_mgr.SLICE_RADIUS + 0.005)).A
-                self.DOBOT.attach(cuc_slice)
-                self.env.step(0.05)
-                self._move("Omron move away", self.OMRON,
-                           SE3(gx, gy, drop_z + self.DROP_APPROACH_HEIGHT) * self.TOOL_DOWN, linear=True,
-                           steps=10, position_tolerance=0.005)
-        else:
-            print("Skipping the drop: " +
-                  ("slice was not picked up" if not picked else "glass is not held out"))
-
-        # ---- 6. Glass with the slice goes back on the counter -------------------
-        self._park(self.OMRON, "Omron back to start")
-        if have_glass:
-            if self.place_glass(extras=(water, cuc_slice if cuc_slice in [a['shape'] for a in
-                                                                          self.DOBOT.__dict__.get('_attachments', [])]
-                                        else None)):
-                self._park(self.DOBOT, "Dobot back to start")
+        # ---- 2-6. One glass at a time: fill, add a slice, serve ------------
+        served = 0
+        for i in range(n_glasses):
+            print(f"\n----- Glass {i + 1} of {n_glasses} -----")
+            first_step = len(self.step_log)
+            if self.serve_glass(i, slices[i], spot=served):
+                served += 1
+            # label this round's steps with the glass number for the summary
+            self.step_log[first_step:] = [(f"[glass {i + 1}] {label}", ok)
+                                          for label, ok in self.step_log[first_step:]]
+        print(f"\n{served} of {n_glasses} glasses served")
 
         # ---- Summary --------------------------------------------------------
         print("\n" + "=" * 50 + "\nTASK SUMMARY\n" + "=" * 50)
@@ -713,7 +791,11 @@ class TaskSimulation():
 
 
 if __name__ == "__main__":
-    # py -3.11 Task-Simulation/task_simulation.py           -> runs the task straight away
-    # py -3.11 Task-Simulation/task_simulation.py --teach   -> teach pendant first
-    sim = TaskSimulation(use_teach_pendant="--teach" in sys.argv)
+    # py -3.11 Task-Simulation/task_simulation.py              -> runs the task straight away
+    # py -3.11 Task-Simulation/task_simulation.py --teach      -> teach pendant first
+    # py -3.11 Task-Simulation/task_simulation.py --speed 4    -> play the motion 4x faster
+    speed = 1.0
+    if "--speed" in sys.argv:
+        speed = float(sys.argv[sys.argv.index("--speed") + 1])
+    sim = TaskSimulation(use_teach_pendant="--teach" in sys.argv, speed=speed)
     sim.launch_simulation()
