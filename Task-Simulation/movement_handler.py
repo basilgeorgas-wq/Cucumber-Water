@@ -19,6 +19,35 @@ from collision_handler import (
 # requested orientation (unless the move is called with position_only=True)
 DEFAULT_ORIENTATION_TOLERANCE = np.deg2rad(1.0)   # radians
 
+# Animation playback speed: 1 = real time, 2 = twice as fast, ...
+# (only changes how fast Swift plays the motion back, not the motion itself)
+PLAYBACK_SPEED = 1.0
+
+# Hook for a control panel (see control_panel.py). Called as FRAME_HOOK(robot, q)
+# just before every animation frame is shown (robot/q are None for plain waits).
+# It may block (pause / e-stop), raise TaskAborted (reset), or return False to
+# halt the current motion (e.g. an obstacle has appeared in its way).
+FRAME_HOOK = None
+
+
+class TaskAborted(Exception):
+    """Raised by the control panel to abandon the running task."""
+
+
+def frame_allowed(robot, q):
+    return FRAME_HOOK is None or FRAME_HOOK(robot, q) is not False
+
+
+def wait(env, seconds):
+    """Hold still for a while, frame by frame (so pause / e-stop still work)."""
+    if env is None:
+        return
+    seconds = seconds / PLAYBACK_SPEED
+    n = max(1, int(round(seconds / 0.05)))
+    for _ in range(n):
+        frame_allowed(None, None)
+        env.step(seconds / n)
+
 def ikine_move(robot, target_pose, env=None, q0=None, 
                steps=50, interpolation=2, point_freq=1, 
                visualize=True, show_path_dots=True,
@@ -192,12 +221,14 @@ def ikine_move(robot, target_pose, env=None, q0=None,
         if not trajectory_success:
             print("\n WARNING: Visualizing trajectory that contains collisions!")
         
-        animate_trajectory_unified(
+        err = animate_trajectory_unified(
             robot, q_matrix, T_target, env,
             point_freq=point_freq,
             collision_free=trajectory_success,
             show_dots=show_path_dots
         )
+        if err == float('inf'):
+            trajectory_success = False      # halted part-way (control panel)
     
     print_section_footer()
     return q_matrix, q_target, trajectory_success
@@ -532,10 +563,13 @@ def rmrc_move(robot, q0, cartesian_path, env, delta_t=0.05,
                 stopped = f"collision ahead at step {i+1}/{steps}"
                 break
 
+        if not frame_allowed(robot, q_next):
+            stopped = f"halted by the control panel at step {i+1}/{steps}"
+            break
         q_trajectory.append(q_next)
         robot.q = q_next
         if env is not None:
-            env.step(delta_t)
+            env.step(delta_t / PLAYBACK_SPEED)
 
         # Track how far the tool strays from the path
         T_now = robot.fkine(q_next)
@@ -975,8 +1009,11 @@ def animate_trajectory_unified(robot, q_matrix, T_target, env,
     print("\n Animating trajectory")
     
     for i, q in enumerate(q_matrix):
+        if not frame_allowed(robot, q):
+            print(" Motion halted part-way (control panel)")
+            return float('inf')
         robot.q = q
-        env.step(0.05)
+        env.step(0.05 / PLAYBACK_SPEED)
         
         # Add visual dots
         if show_dots and i % point_freq == 0:

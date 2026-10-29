@@ -29,9 +29,23 @@ from movement_handler import (ikine_move, rmrc_move, linear_move, start_joystick
                               create_linear_path, find_approach_configuration,
                               generate_ik_initial_guesses, solve_ik_with_strategies,
                               wrap_to_reference, get_joint_limits)
+from collision_handler import collision_report, check_single_config_collision
+from spatialgeometry import Cuboid
+
+class StepLog(list):
+    """List of (label, ok) for the summary; labels get the current prefix
+    (e.g. '[glass 2] ') as they are added."""
+    prefix = ""
+
+    def append(self, item):
+        label, ok = item
+        super().append((self.prefix + label, ok))
+
 
 class TaskSimulation():
-    def __init__(self, use_teach_pendant=False, speed=1.0):
+    def __init__(self, use_teach_pendant=False, speed=1.0, controller=None):
+        # Control panel window (control_panel.py) - None = old keyboard controls
+        self.controller = controller
         # True: open the Omron teach pendant first; press Enter to start the task
         self.use_teach_pendant = use_teach_pendant
         # Animation playback speed (1 = real time). Planning time is unaffected.
@@ -53,9 +67,11 @@ class TaskSimulation():
         # Lock for thread-safe flag access
         self.estop_lock = threading.Lock()
         
-        # Start emergency stop listener thread
-        self.estop_thread = threading.Thread(target=self._emergency_stop_listener, daemon=True)
-        self.estop_thread.start()
+        # Keyboard emergency stop ('e' / 'q') - only without the control panel,
+        # which has its own E-STOP button
+        if controller is None:
+            self.estop_thread = threading.Thread(target=self._emergency_stop_listener, daemon=True)
+            self.estop_thread.start()
     
         # Define workspace limits (x, y, z boundaries in meters)
         self.WORKSPACE_LIMITS = {
@@ -152,8 +168,12 @@ class TaskSimulation():
         
         sys.exit(0)
     
-    def check_pause(self):
-        """Check if simulation should pause (called in main loop)"""
+    def check_pause(self, label=None):
+        """Called before every move: waits while paused / e-stopped (and in step
+        mode, until 'Next step'). Returns False if the simulation is ending."""
+        if self.controller is not None:
+            self.controller.before_move(label)
+            return True
         if self.emergency_stop_active:
             self.pause_event.wait()  # Block until resumed
         
@@ -172,6 +192,46 @@ class TaskSimulation():
 
     #TODO fix Collision(Non-functional), link collision also not integrated, 
     #     Add hardware e-stop(Figure out how to have joystick permanently running during program?)
+    def setup_scene(self):
+        """Build everything (Swift, kitchen, robots, grippers, glasses) without
+        running the task. Used by the control panel."""
+        self.env = swift.Swift()
+        self.env.launch(realtime=True)
+        self.environment = Environment_Manager(self.env)
+        faces, vertices, face_normals = self.environment.get_collision_data()
+        self.Motoman = MOTOMAN_GP4()
+        self.Motoman.setbase(SE3(-1.1, -0.2, 0.92) * SE3.Rz(np.pi))
+        self.Motoman.add_to_env(self.env)
+        self.OMRON = OMRON_TM5_700()
+        self.OMRON.setbase(SE3(-0.1, 0, 0.92))
+        self.OMRON.add_to_env(self.env)
+        self.DOBOT = DOBOT_CR5()
+        self.DOBOT.setbase(SE3(-0.1, -1.5, 0.92))
+        self.DOBOT.add_to_env(self.env)
+        robots = [self.Motoman, self.OMRON, self.DOBOT]
+        self._mount_grippers()
+        self._setup_dobot_with_glass(faces, vertices, face_normals, robots)
+        self._finish_setup(faces, vertices, face_normals, robots, [])
+        self.setup_safety_demo()
+        self.env.step(0.05)
+
+    def _finish_setup(self, faces, vertices, face_normals, robots, collisions_list):
+        """Shared settings for every move, and a record of the start state
+        (so the scene can be reset)."""
+        self._move_kwargs = dict(env=self.env, faces=faces, vertices=vertices,
+                                 face_normals=face_normals, other_robots=robots,
+                                 collisions_list=collisions_list, show_path_dots=False)
+        self._markers = collisions_list                 # red balls at collision points
+        self._refresh_obstacles()          # includes the glasses on the counter
+        self.step_log = StepLog()
+        self._home_q = {r.name: np.array(r.q, dtype=float) for r in robots}
+        # what each robot carries from the start (grippers, the knife) - kept on reset
+        self._base_attachments = {r.name: {id(a['shape']) for a in r.__dict__.get('_attachments', [])}
+                                  for r in robots}
+        self.n_glasses = len(self.glasses)
+        self.progress = (0, self.n_glasses)
+        self._spawned = []                              # slices / water made during a run
+
     def launch_simulation(self):
         """Create the Swift environment and run the simulation"""
         # Create the Swift environment
@@ -216,12 +276,7 @@ class TaskSimulation():
                 self.env.step(0.05)           # Update Swift visualization
             fig.close()
 
-        # Settings shared by every move below
-        self._move_kwargs = dict(env=self.env, faces=faces, vertices=vertices,
-                                 face_normals=face_normals, other_robots=robots,
-                                 collisions_list=collisions_list, show_path_dots=False)
-        self._refresh_obstacles()          # includes the glasses on the counter
-        self.step_log = []
+        self._finish_setup(faces, vertices, face_normals, robots, collisions_list)
         self.run_task()
 
         # self.initiate_joystick_control(robot=self.DOBOT, duration=300)
@@ -301,11 +356,31 @@ class TaskSimulation():
     # ======================================================================
     def _pause(self, seconds):
         """Hold still for a moment (e.g. while a gripper closes), scaled by the playback speed."""
-        self.env.step(seconds / movement_handler.PLAYBACK_SPEED)
+        movement_handler.wait(self.env, seconds)
+
+    def _halted(self):
+        """True (once) if the control panel stopped the last move because
+        something appeared in its way."""
+        return self.controller is not None and self.controller.take_halt()
+
+    def _replan_after_halt(self, label, robot, target, preferred_q=None):
+        """The robot stopped part-way because something is in its way: plan a new
+        path from where it is now, round the obstacle (a few tries)."""
+        args = dict(self._move_kwargs)          # includes the new obstacle
+        if preferred_q is not None:
+            args['preferred_q'] = preferred_q
+        for attempt in range(3):
+            print(f"{label}: stopped - something is in the way, planning around it")
+            q_matrix, _, ok = ikine_move(robot=robot, target_pose=target, q0=robot.q, **args)
+            if q_matrix is not None and ok:
+                return True
+            if not self._halted() and attempt >= 1:
+                break
+        return False
 
     def _move(self, label, robot, target, linear=False, **kwargs):
         """Run one move with the shared settings. Returns True if the robot got there."""
-        if not self.check_pause():
+        if not self.check_pause(label):
             return False
         args = dict(self._move_kwargs)
         args.update(kwargs)
@@ -319,14 +394,16 @@ class TaskSimulation():
                     print(f"{label}: no path found - trying again")
                 q_matrix, _, ok = ikine_move(robot=robot, target_pose=target, q0=robot.q, **args)
                 success = q_matrix is not None and ok
-                if success:
+                if success or self.controller is not None and self.controller.halted:
                     break
+        if not success and self._halted():
+            success = self._replan_after_halt(label, robot, target, kwargs.get('preferred_q'))
         self.step_log.append((label, success))
         return success
 
     def _move_above(self, label, robot, T_above, T_down):
         """Go to T_above in an arm shape that can then move straight down to T_down."""
-        if not self.check_pause():
+        if not self.check_pause(label):
             return False
         kw = self._move_kwargs
         q_hint = find_approach_configuration(
@@ -509,7 +586,7 @@ class TaskSimulation():
     def _move_glass(self, label, target, steps=40):
         """Dobot move while carrying the glass: a straight line first (an upright
         glass stays upright), path planning (RRT) only if the line is blocked."""
-        if not self.check_pause():
+        if not self.check_pause(label):
             return False
         args = {k: v for k, v in self._move_kwargs.items() if k != 'collisions_list'}
         buf_ok = False
@@ -519,12 +596,15 @@ class TaskSimulation():
             buf_ok = True
         else:
             print(f"{label}: straight line blocked - planning a path around")
+            self._halted()                    # (planning from here covers that anyway)
             for attempt in range(2):          # path planning is random: one more try if it fails
                 q_matrix, _, ok = ikine_move(robot=self.DOBOT, target_pose=target, q0=self.DOBOT.q,
                                              **self._move_kwargs)
                 buf_ok = q_matrix is not None and ok
-                if buf_ok:
+                if buf_ok or self.controller is not None and self.controller.halted:
                     break
+        if not buf_ok and self._halted():
+            buf_ok = self._replan_after_halt(label, self.DOBOT, target)
         self.step_log.append((label, buf_ok))
         return buf_ok
 
@@ -647,6 +727,7 @@ class TaskSimulation():
         if filled:
             self.glass_tilt_limit = self.GLASS_TILT_LIMIT      # full glass: keep it level
             water = env_mgr.add_water()
+            self._spawned.append(water)
             # water cylinder is centred on its origin: put it in the lower part of the glass
             self.DOBOT.attach(water, self.T_flange_glass @ SE3(0, 0, 0.6 * H / 2 + 0.005).A)
             for _ in range(10):
@@ -714,6 +795,236 @@ class TaskSimulation():
         self._park(self.DOBOT, "Dobot back to start")
         return placed
 
+    # ======================================================================
+    # Control panel support: reset, display toggles, teach pendant, safety demo
+    # ======================================================================
+    HIDDEN = SE3(0, 0, -50).A                  # where unused shapes are parked out of sight
+
+    @property
+    def robots(self):
+        return [self.Motoman, self.OMRON, self.DOBOT]
+
+    def reset_scene(self, n_glasses=None):
+        """Put everything back to the start: robots home, grippers open, cucumber
+        in the fridge, n_glasses empty glasses on the counter. Instant (not a move)."""
+        env_mgr = self.environment
+        if n_glasses is not None:
+            self.n_glasses = int(max(1, min(n_glasses, len(self.glasses))))
+        for r in self.robots:
+            keep = self._base_attachments[r.name]
+            for a in list(r.__dict__.get('_attachments', [])):
+                if id(a['shape']) not in keep:
+                    r.detach(a['shape'])
+            r.q = self._home_q[r.name]
+        self.omron_gripper.open()
+        self.dobot_gripper.open()
+        self.DOBOT.path_constraint = None
+        self.DOBOT.project_to_constraint = None
+        self.glass_tilt_limit = self.GLASS_TILT_LIMIT
+        for shape in self._spawned:                    # slices and water from the last run
+            shape.T = self.HIDDEN
+        self._spawned = []
+        env_mgr.cucumber.T = env_mgr.cucumber_fridge_pose().A
+        for name in [o['name'] for o in env_mgr.obstacles
+                     if o['name'].startswith(('glass_', 'served_glass_'))]:
+            env_mgr.remove_obstacle(name)
+        for i, glass in enumerate(self.glasses):
+            if i < self.n_glasses:
+                base = self.GLASS_START_POSITIONS[i]
+                glass.T = SE3(*base).A
+                env_mgr.add_glass_obstacle(f"glass_{i + 1}", base)
+            else:
+                glass.T = self.HIDDEN
+        self.glass = self.glasses[0]
+        self._refresh_obstacles()
+        for m in self._markers:
+            m.T = self.HIDDEN
+        del self._markers[:]
+        self.step_log = StepLog()
+        self.progress = (0, self.n_glasses)
+
+    def show_hitboxes(self, visible):
+        self.environment.show_hitboxes(visible)
+
+    def show_collision_markers(self, visible):
+        """Red balls dropped where a straight path would have collided."""
+        self._move_kwargs['collisions_list'] = self._markers if visible else None
+        for m in self._markers:
+            if not visible:
+                m._shown_T = np.asarray(m.T).copy()
+                m.T = self.HIDDEN
+            elif hasattr(m, '_shown_T'):
+                m.T = m._shown_T
+
+    # ---- Teach pendant ---------------------------------------------------------
+    def _blocked_by(self, robot, q):
+        """What the robot would hit at joints q (None if nothing)."""
+        kw = self._move_kwargs
+        names = [o['name'] for o in self.environment.obstacles]
+        hits = collision_report(robot, q, kw['vertices'], obstacle_names=names,
+                                other_robots=kw['other_robots'])
+        return hits[0][1] if hits else None
+
+    def teach_set_joints(self, robot, q):
+        """Move straight to joint angles q (degrees from the sliders already converted).
+        Refuses poses that hit something. Returns a message for the panel."""
+        lim = get_joint_limits(robot)
+        q = np.clip(np.asarray(q, float), lim[0], lim[1])
+        hit = self._blocked_by(robot, q)
+        if hit:
+            return f"Blocked: {robot.name} would hit {hit}"
+        q0 = np.array(robot.q, float)
+        n = max(1, int(np.ceil(np.max(np.abs(q - q0)) / np.deg2rad(2))))
+        for k in range(1, n + 1):                      # small steps, so it looks smooth
+            qk = q0 + (q - q0) * k / n
+            if not movement_handler.frame_allowed(robot, qk):
+                return "Stopped"
+            robot.q = qk
+            self.env.step(0.02)
+        return ""
+
+    def teach_jog(self, robot, dx=0.0, dy=0.0, dz=0.0):
+        """Move the hand in a straight line by (dx, dy, dz) metres, same orientation."""
+        T = SE3(dx, dy, dz) * SE3(robot.fkine(robot.q).A)
+        args = {k: v for k, v in self._move_kwargs.items() if k != 'collisions_list'}
+        q_matrix, ok, diag = linear_move(robot=robot, target_pose=T, steps=6,
+                                         position_tolerance=0.003, **args)
+        if q_matrix is not None and ok:
+            return ""
+        diag = diag or {}
+        if diag.get('error') == 'target_unreachable':
+            return "Can't move there: out of the arm's reach (or past a joint limit)"
+        if diag.get('collision_waypoints'):
+            q_hit = q_matrix[diag['collision_waypoints'][0]] if q_matrix is not None else None
+            hit = self._blocked_by(robot, q_hit) if q_hit is not None else None
+            return f"Can't move there: it would hit {hit or 'something'}"
+        if diag.get('jump_waypoints') or self.singularity_level(robot) < self.SINGULAR_WARNING:
+            return ("Can't move that way in a straight line: the arm is at or near a singularity. "
+                    + self.singularity_advice(robot))
+        return "Can't move there in a straight line (joint limit or out of reach)"
+
+    # Near a singularity = manipulability below 15% of what's typical for that robot
+    # (the three arms differ ~4x in size, so one fixed number doesn't suit them all)
+    SINGULAR_WARNING = 0.15
+    _typical_manip = {}
+
+    def singularity_advice(self, robot, q=None):
+        """Which joints to bend (with the sliders) to get out of a singularity."""
+        q = np.array(robot.q if q is None else q, dtype=float)
+        lim = get_joint_limits(robot)
+        names = {2: "J3 (elbow)", 4: "J5 (wrist)"}
+        for joints in ((4,), (2,), (2, 4)):
+            for sign in (1, -1):
+                q2 = q.copy()
+                for j in joints:
+                    q2[j] = np.clip(q2[j] + sign * np.radians(30), lim[0, j], lim[1, j])
+                if self.singularity_level(robot, q2) > self.SINGULAR_WARNING:
+                    return "Bend " + " and ".join(names[j] for j in joints) + " with the sliders first."
+        return "Move a few joints with the sliders first."
+
+    def singularity_level(self, robot, q=None):
+        """Manipulability relative to the robot's typical value (median over random
+        poses): about 1 = normal, 0 = singular."""
+        if robot.name not in self._typical_manip:
+            lim = get_joint_limits(robot)
+            qs = np.random.default_rng(0).uniform(lim[0], lim[1], (300, robot.n))
+            self._typical_manip[robot.name] = float(np.median([self.manipulability(robot, x) for x in qs]))
+        return self.manipulability(robot, q) / self._typical_manip[robot.name]
+
+    @staticmethod
+    def manipulability(robot, q=None):
+        """Yoshikawa's measure: sqrt(det(J J^T)), 0 at a singularity."""
+        J = robot.jacob0(robot.q if q is None else q)
+        return float(np.sqrt(max(np.linalg.det(J @ J.T), 0.0)))
+
+    def teach_gripper(self, robot, close):
+        g = {self.OMRON.name: self.omron_gripper, self.DOBOT.name: self.dobot_gripper}.get(robot.name)
+        if g is None:
+            return f"{robot.name} has a knife, not a gripper"
+        g.grip() if close else g.open()
+        self.env.step(0.05)
+        return ""
+
+    def teach_home(self, robot):
+        ok = self._park(robot, f"Teach: {robot.name} home")
+        return "" if ok else "Couldn't find a path home"
+
+    # ---- Safety demo: light curtain + an obstacle dropped in a robot's way -------
+    CURTAIN_X = 0.80                      # light curtain: vertical plane across the open side
+    CURTAIN_Y = (-2.6, 1.2)
+    CURTAIN_HEIGHT = 1.9
+    PERSON_RADIUS = 0.2
+    PERSON_Y = -0.8
+    PERSON_OUTSIDE_X = 2.2                # where the person stands, well clear
+    PERSON_INSIDE_X = 0.5                 # where they walk to (past the curtain)
+    # The dropped obstacle: a pot left in the back of the sink, right where the
+    # Dobot's route from the counter to the tap dips in. The task can still be
+    # done round it (tested), it just needs a new path.
+    DEMO_OBSTACLE_CENTRE = (-0.56, -1.60, 0.89)
+    DEMO_OBSTACLE_SIZE = (0.14, 0.14, 0.30)
+
+    def setup_safety_demo(self):
+        """Light curtain posts + beam (yellow; red when broken), a person, and the demo box."""
+        from spatialgeometry import Cylinder, Sphere
+        x, (y0, y1), h = self.CURTAIN_X, self.CURTAIN_Y, self.CURTAIN_HEIGHT
+        for y in (y0, y1):
+            post = Cylinder(radius=0.035, length=h, color=(0.15, 0.15, 0.15, 1.0),
+                            pose=SE3(x, y, h / 2))
+            self.env.add(post)
+        beam_pose = SE3(x, (y0 + y1) / 2, h / 2)
+        self._curtain_ok = Cuboid(scale=[0.004, y1 - y0, h], color=[1.0, 0.85, 0.0, 0.15])
+        self._curtain_tripped = Cuboid(scale=[0.004, y1 - y0, h], color=[1.0, 0.0, 0.0, 0.35])
+        self._curtain_pose = beam_pose.A
+        self._curtain_ok.T = beam_pose
+        self._curtain_tripped.T = self.HIDDEN
+        self.env.add(self._curtain_ok)
+        self.env.add(self._curtain_tripped)
+        self._person_body = Cylinder(radius=self.PERSON_RADIUS, length=1.35,
+                                     color=(0.2, 0.35, 0.8, 1.0))
+        self._person_head = Sphere(radius=0.12, color=(0.95, 0.8, 0.65, 1.0))
+        self.env.add(self._person_body)
+        self.env.add(self._person_head)
+        self.place_person(self.PERSON_OUTSIDE_X)
+        self._demo_box = None
+        self._demo_vertices = None
+
+    def place_person(self, x):
+        self._person_x = x
+        self._person_body.T = SE3(x, self.PERSON_Y, 0.675).A
+        self._person_head.T = SE3(x, self.PERSON_Y, 1.5).A
+
+    def person_inside_curtain(self):
+        return self._person_x - self.PERSON_RADIUS < self.CURTAIN_X
+
+    def show_curtain_tripped(self, tripped):
+        self._curtain_tripped.T = self._curtain_pose if tripped else self.HIDDEN
+        self._curtain_ok.T = self.HIDDEN if tripped else self._curtain_pose
+
+    def add_demo_obstacle(self):
+        if self._demo_box is not None:
+            return
+        self._demo_box = self.environment.add_box_obstacle(
+            "dropped_box", self.DEMO_OBSTACLE_CENTRE, self.DEMO_OBSTACLE_SIZE)
+        self._demo_vertices = [o for o in self.environment.obstacles
+                               if o['name'] == 'dropped_box'][0]['vertices']
+        self._refresh_obstacles()
+
+    def remove_demo_obstacle(self):
+        if self._demo_box is None:
+            return
+        self._demo_box.T = self.HIDDEN
+        self._demo_box = None
+        self._demo_vertices = None
+        self.environment.remove_obstacle("dropped_box")
+        self._refresh_obstacles()
+
+    def would_hit_demo_obstacle(self, robot, q):
+        """Checked every frame: would this frame put the robot into the dropped box?"""
+        if self._demo_vertices is None:
+            return False
+        hit, _ = check_single_config_collision(robot, q, None, self._demo_vertices, None)
+        return hit
+
     def _park(self, robot, label):
         """Send a robot back to the joint angles it started the task with."""
         q_home = self._home_q[robot.name]
@@ -722,8 +1033,13 @@ class TaskSimulation():
     def run_task(self):
         env_mgr = self.environment
         # Where each robot started: it can return here to get out of the others' way
-        self._home_q = {r.name: np.array(r.q, dtype=float)
-                        for r in (self.Motoman, self.OMRON, self.DOBOT)}
+        if not getattr(self, '_home_q', None):
+            self._home_q = {r.name: np.array(r.q, dtype=float)
+                            for r in (self.Motoman, self.OMRON, self.DOBOT)}
+        if not hasattr(self, '_spawned'):
+            self._spawned = []
+        if not isinstance(self.step_log, StepLog):
+            self.step_log = StepLog(self.step_log)
         # ---- 0. Omron takes the cucumber out of the fridge ----------------------
         if not self.fetch_cucumber():
             print("Cucumber not delivered to the bench - the Motoman will cut thin air")
@@ -752,7 +1068,8 @@ class TaskSimulation():
         # One slice per glass: each cut slice appears in the row next to the cucumber.
         print("Motoman performing slicing")
         cut_pose = SE3.RPY([0, self.CUT_PITCH, 0])
-        n_glasses = len(self.glasses)
+        n_glasses = min(getattr(self, 'n_glasses', len(self.glasses)), len(self.glasses))
+        self.progress = (0, n_glasses)
         slices = []
         y = 0
         for i in range(n_glasses):
@@ -763,6 +1080,7 @@ class TaskSimulation():
                        SE3(self.CUT_FLANGE_X, y, self.CUT_DOWN_Z) @ cut_pose, linear=True,
                        steps=10, position_tolerance=0.005, check_reachability=True)
             slices.append(env_mgr.add_slice(SE3(*self.SLICE_POSITIONS[i])))
+            self._spawned.append(slices[-1])
             y += -0.05
             self._pause(0.05)
 
@@ -775,12 +1093,13 @@ class TaskSimulation():
         served = 0
         for i in range(n_glasses):
             print(f"\n----- Glass {i + 1} of {n_glasses} -----")
-            first_step = len(self.step_log)
-            if self.serve_glass(i, slices[i], spot=served):
-                served += 1
-            # label this round's steps with the glass number for the summary
-            self.step_log[first_step:] = [(f"[glass {i + 1}] {label}", ok)
-                                          for label, ok in self.step_log[first_step:]]
+            self.progress = (i + 1, n_glasses)
+            self.step_log.prefix = f"[glass {i + 1}] "     # label this round's steps
+            try:
+                if self.serve_glass(i, slices[i], spot=served):
+                    served += 1
+            finally:
+                self.step_log.prefix = ""
         print(f"\n{served} of {n_glasses} glasses served")
 
         # ---- Summary --------------------------------------------------------
@@ -791,11 +1110,17 @@ class TaskSimulation():
 
 
 if __name__ == "__main__":
-    # py -3.11 Task-Simulation/task_simulation.py              -> runs the task straight away
-    # py -3.11 Task-Simulation/task_simulation.py --teach      -> teach pendant first
-    # py -3.11 Task-Simulation/task_simulation.py --speed 4    -> play the motion 4x faster
+    # py -3.11 Task-Simulation/task_simulation.py              -> opens the control panel
+    # py -3.11 Task-Simulation/task_simulation.py --no-gui     -> runs the task straight away
+    #                                                             (keyboard e-stop: e / r / q)
+    # py -3.11 Task-Simulation/task_simulation.py --no-gui --teach  -> old matplotlib teach first
+    # --speed 2                                                -> start at 2x playback speed
     speed = 1.0
     if "--speed" in sys.argv:
         speed = float(sys.argv[sys.argv.index("--speed") + 1])
-    sim = TaskSimulation(use_teach_pendant="--teach" in sys.argv, speed=speed)
-    sim.launch_simulation()
+    if "--no-gui" in sys.argv:
+        sim = TaskSimulation(use_teach_pendant="--teach" in sys.argv, speed=speed)
+        sim.launch_simulation()
+    else:
+        import control_panel
+        control_panel.main(speed=speed)

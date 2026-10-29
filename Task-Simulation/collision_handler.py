@@ -185,9 +185,39 @@ def _cached_boxes(vertices):
     boxes = _box_cache.get(key)
     if boxes is None:
         boxes = boxes_from_vertices(vertices)
-        _box_cache.clear()
+        if len(_box_cache) > 16:
+            _box_cache.clear()
         _box_cache[key] = boxes
+        # stacked copies for the all-at-once test
+        _box_cache[('arrays',) + key] = (np.array([b['centre'] for b in boxes]),
+                                         np.array([b['R'] for b in boxes]),
+                                         np.array([b['half'] for b in boxes]))
     return boxes
+
+
+def _capsules_vs_boxes(capsules, box_arrays):
+    """Every capsule against every box at once (same test as
+    segment_box_intersection, vectorised). Returns (hit (N,M) bool, entry points (N,M,3))."""
+    C, R, H = box_arrays                                    # (M,3) (M,3,3) (M,3)
+    P0 = np.array([c[1] for c in capsules])                 # (N,3)
+    P1 = np.array([c[2] for c in capsules])
+    rad = np.array([c[3] for c in capsules])                # (N,)
+    A = np.einsum('nmk,mkj->nmj', P0[:, None, :] - C[None], R)   # start, in each box frame
+    D = np.einsum('nmk,mkj->nmj', P1[:, None, :] - C[None], R) - A
+    h = H[None, :, :] + rad[:, None, None]                  # box grown by each capsule radius
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t1 = (-h - A) / D
+        t2 = (h - A) / D
+    parallel = np.abs(D) < 1e-12
+    lo = np.where(parallel, -np.inf, np.minimum(t1, t2))
+    hi = np.where(parallel, np.inf, np.maximum(t1, t2))
+    outside_parallel = parallel & (np.abs(A) > h)
+    t_enter = np.maximum(lo.max(axis=2), 0.0)
+    t_exit = np.minimum(hi.min(axis=2), 1.0)
+    hit = (t_enter <= t_exit) & ~outside_parallel.any(axis=2)
+    local = A + t_enter[:, :, None] * D
+    points = C[None] + np.einsum('mjk,nmk->nmj', R, local)
+    return hit, points
 
 
 def _other_robot_capsules(other, margin):
@@ -294,6 +324,84 @@ def _capsule_aabbs(capsules):
     return np.minimum(p0, p1) - r, np.maximum(p0, p1) + r
 
 
+# Self-collision check (a robot's own links against each other): written, but
+# switched off for now - it's still too cautious and flags some poses that are
+# actually clear. Being finished next.
+SELF_COLLISION_CHECK = False
+
+# Control panel hook: called during long path searches, raises to abandon them
+ABORT_CHECK = None
+
+
+def _self_label_index(robot, label):
+    """Link index a capsule belongs to; carried things ('tool') count as past the flange."""
+    return robot.n + 1 if label == 'tool' else int(label)
+
+
+def _self_pair_allowed(robot, a, b):
+    """Can parts a and b of the same robot touch without it being a collision?
+    Neighbouring links always touch at their joint, and a carried object (tool)
+    is held right at the flange, so it can't hit the last few links."""
+    ia, ib = _self_label_index(robot, a), _self_label_index(robot, b)
+    if abs(ia - ib) <= 1:
+        return True
+    if 'tool' in (a, b) and min(ia, ib) >= robot.n - 2:
+        return True
+    return (min(ia, ib), max(ia, ib)) in _self_reference_pairs(robot)
+
+
+def set_self_collision_reference(robot, q=None):
+    """Record which link pairs already overlap (precise shapes) at a reference pose -
+    by default the robot's current one, i.e. its start pose. Those overlaps are part
+    of the model (e.g. a housing that wraps round the next link), not a collision."""
+    q = np.asarray(robot.q if q is None else q, float)
+    hulls = getattr(robot, 'collision_link_hulls', None)
+    pairs = set()
+    if hulls:
+        poses = get_link_poses(robot, q)
+        for i in range(len(hulls)):
+            for j in range(i + 2, len(hulls)):
+                if _parts_touch(_world_shapes(robot, poses, i, None),
+                                _world_shapes(robot, poses, j, None)):
+                    pairs.add((i, j))
+    robot.__dict__['_self_reference_pairs'] = pairs
+    return pairs
+
+
+def _self_reference_pairs(robot):
+    pairs = robot.__dict__.get('_self_reference_pairs')
+    if pairs is None:
+        pairs = set_self_collision_reference(robot)
+    return pairs
+
+
+def _self_collision(robot, capsules, poses, stop_at_first=True):
+    """The robot's own parts against each other (links, gripper, carried objects)."""
+    hits = []
+    if len(capsules) < 2:
+        return hits
+    lo, hi = _capsule_aabbs(capsules)
+    overlap = np.all((lo[:, None, :] <= hi[None, :, :]) & (lo[None, :, :] <= hi[:, None, :]), axis=2)
+    verdict = {}
+    for i, j in zip(*np.nonzero(np.triu(overlap, 1))):
+        a, a0, a1, ra = capsules[i]
+        b, b0, b1, rb = capsules[j]
+        if _self_pair_allowed(robot, a, b):
+            continue
+        dist, c1, c2 = segment_segment_distance(a0, a1, b0, b1)
+        if dist >= ra + rb:
+            continue
+        key = (a, b) if 'tool' not in (a, b) else (a, b, i, j)
+        if key not in verdict:
+            verdict[key] = _parts_touch(_world_shapes(robot, poses, a, capsules[i]),
+                                        _world_shapes(robot, poses, b, capsules[j]))
+        if verdict[key]:
+            hits.append((a, f"{robot.name}:{b} (itself)", (c1 + c2) / 2))
+            if stop_at_first:
+                return hits
+    return hits
+
+
 def _collision_pairs(robot, q, vertices, other_robots, margin, ignore_links,
                      obstacle_names=None, stop_at_first=True):
     """Core check. Returns a list of (my_label, what_was_hit, contact_point)."""
@@ -319,22 +427,28 @@ def _collision_pairs(robot, q, vertices, other_robots, margin, ignore_links,
     if vertices is not None and len(vertices) > 0:
         boxes = _cached_boxes(vertices)
         names = obstacle_names or [f"obstacle_{k}" for k in range(len(boxes))]
-        for label, p0, p1, rad in my_capsules:
-            for bi, (name, box) in enumerate(zip(names, boxes)):
-                hit, point = segment_box_intersection(p0, p1, box, rad)
-                if not hit:
-                    continue
-                if hulls and isinstance(label, (int, np.integer)) and label < len(hulls):
-                    key = (label, bi)
-                    if key not in hull_verdict:
-                        hull_verdict[key] = _link_hull_hits_box(robot, poses, label, box)
-                    if not hull_verdict[key]:
-                        continue          # capsule touched, the real link shape doesn't
-                hits.append((label, name, point))
-                if stop_at_first:
-                    return hits
+        box_arrays = _box_cache[('arrays', id(vertices), np.shape(vertices))]
+        hit_matrix, entry = _capsules_vs_boxes(my_capsules, box_arrays) if my_capsules else (np.zeros((0, 0), bool), None)
+        for ci, bi in zip(*np.nonzero(hit_matrix)):          # capsule-major order, as before
+            label = my_capsules[ci][0]
+            name, box, point = names[bi], boxes[bi], entry[ci, bi]
+            if hulls and isinstance(label, (int, np.integer)) and label < len(hulls):
+                key = (label, bi)
+                if key not in hull_verdict:
+                    hull_verdict[key] = _link_hull_hits_box(robot, poses, label, box)
+                if not hull_verdict[key]:
+                    continue          # capsule touched, the real link shape doesn't
+            hits.append((label, name, point))
+            if stop_at_first:
+                return hits
 
-    # 2. Robot vs other robots, at the other robots' CURRENT joint angles.
+    # 2. Robot vs itself (e.g. the gripper folding back into its own upper arm)
+    if SELF_COLLISION_CHECK and hulls and all_capsules:
+        hits += _self_collision(robot, all_capsules, poses, stop_at_first)
+        if hits and stop_at_first:
+            return hits
+
+    # 3. Robot vs other robots, at the other robots' CURRENT joint angles.
     #    Base columns are included here: another arm can hit them.
     others = [o for o in (other_robots or []) if o is not robot]
     if others and all_capsules:
@@ -595,6 +709,8 @@ def find_collision_free_path_rrt(robot, q_start, q_goal, faces, vertices, face_n
         for it in range(budget):
             if time.time() - t0 > max_time:
                 break
+            if ABORT_CHECK is not None:
+                ABORT_CHECK()              # control panel: raises to abandon the task
             q_rand = rng.uniform(lo, hi)        # only sets a direction to grow in
 
             # EXTEND tree_a one step towards the sample
