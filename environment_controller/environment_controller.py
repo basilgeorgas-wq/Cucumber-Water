@@ -12,6 +12,7 @@ class Environment_Manager():
         print("Initializing Environment Manager")
         self.env = env
         self.obstacles = []  # Store obstacle data
+        self.hitbox_shapes = []  # the red see-through boxes drawn for each obstacle
         
         # Cucumber starts on the fridge's top shelf, lying front-to-back with its
         # front end sticking out past the shelf edge (that's where the Omron grips it)
@@ -148,6 +149,25 @@ class Environment_Manager():
         self.obstacles.append({'name': name, 'vertices': v, 'faces': f,
                                'face_normals': np.array(n, dtype=float)})
 
+    def show_hitboxes(self, visible):
+        """Show or hide the red obstacle boxes (hidden ones are parked out of sight)."""
+        for shape, T in self.hitbox_shapes:
+            shape.T = T if visible else SE3(0, 0, -50).A
+
+    def add_box_obstacle(self, name, centre, size, color=(1.0, 0.55, 0.0, 0.9)):
+        """A solid box that appears in the scene AND is an obstacle for the robots
+        (e.g. something put down in a robot's way). Returns its Swift shape."""
+        pose = SE3(*centre)
+        shape = Cuboid(scale=list(size), color=list(color))
+        shape.T = pose
+        self.env.add(shape)
+        v, f, n = RectangularPrism(*size, center=[0, 0, 0]).get_data()
+        v = (pose.A @ np.c_[np.array(v), np.ones(len(v))].T).T[:, :3]
+        self.remove_obstacle(name)
+        self.obstacles.append({'name': name, 'vertices': v, 'faces': f,
+                               'face_normals': np.array(n, dtype=float)})
+        return shape
+
     def remove_obstacle(self, name):
         self.obstacles = [o for o in self.obstacles if o['name'] != name]
 
@@ -191,6 +211,7 @@ class Environment_Manager():
         obstacle.T = pose
         obstacle.name = name
         env.add(obstacle)
+        self.hitbox_shapes.append((obstacle, pose.A.copy()))
         
         # Get base geometry centered at origin
         vertices, faces, face_normals = RectangularPrism(lwh[0], lwh[1], lwh[2], center=[0, 0, 0]).get_data()
